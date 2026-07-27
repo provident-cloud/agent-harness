@@ -23,13 +23,24 @@ base_url = "http://127.0.0.1:4000/v1"
 # Codex reads the key from this environment variable; .envrc sets it, and the
 # harness default is sk-harness-local.
 env_key = "LITELLM_MASTER_KEY"
-wire_api = "chat"
+# Must be "responses", not "chat". Codex CLI dropped support for the chat wire
+# API (verified against codex-cli 0.145.0, which refuses to start with
+# `wire_api = "chat" is no longer supported`). LiteLLM serves /v1/responses and
+# bridges it to the Ollama backend, so the aliases work unchanged.
+wire_api = "responses"
 
 # Local models are slower than a hosted frontier endpoint, and on the 32GB tier
 # local-big is a hosted call over the network. Give both room before timing out.
 request_max_retries = 2
 stream_max_retries = 3
 stream_idle_timeout_ms = 300000
+
+# Known rough edge: Codex has no metadata for these alias names, so it warns
+# ("Model metadata for `local-fast` not found") and assumes a very large context
+# window -- 258k in a run here, against a 7B model actually serving 32k. It will
+# happily overpack the prompt. If you see truncation or gibberish on long tasks,
+# pin the context window for the alias in your Codex config rather than trusting
+# the default, and prefer `--profile big` for anything context-heavy.
 
 # `codex --profile big` for compression and review passes; the default profile
 # above stays on local-fast for drafts and short edits.
