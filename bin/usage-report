@@ -134,6 +134,10 @@ def _blank_bucket() -> dict[str, Any]:
         "fallbacks": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
+        # Calls whose provider reported no token counts (tokens_reported=False,
+        # e.g. delegated Codex sessions). Kept separate so they never render as
+        # zero-cost -- a 0 in a metered row would read as "free".
+        "unreported": 0,
         "durations": [],
     }
 
@@ -151,6 +155,8 @@ def _absorb(bucket: dict[str, Any], row: dict[str, Any]) -> None:
             bucket[key] += int(row.get(key) or 0)
         except (TypeError, ValueError):
             pass
+    if row.get("tokens_reported") is False:
+        bucket["unreported"] += 1
     try:
         bucket["durations"].append(float(row["duration_ms"]))
     except (KeyError, TypeError, ValueError):
@@ -277,6 +283,13 @@ def print_offload(data: dict[str, Any], *, by_tool: bool) -> None:
         data["by_route"].get(r, {}).get("calls", 0) for r in ("remote", "frontier")
     )
     print(_d(f"  metered (remote + frontier): {num(metered)} calls"))
+    unreported = data["overall"].get("unreported", 0)
+    if unreported:
+        print(
+            f"  NOTE: {num(unreported)} call(s) reported no token counts "
+            "(e.g. delegated Codex sessions); their true cost is NOT in the "
+            "totals above."
+        )
 
     heading("By alias")
     table(

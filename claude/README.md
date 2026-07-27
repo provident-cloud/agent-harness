@@ -14,6 +14,7 @@ changes it in every workspace wired to this checkout.
 | `/fix-issue <issue>` | Fix a GitHub issue across every repo in the workspace. Searches all siblings before editing, compresses long input first, keeps cross-repo contracts symmetric, and ends with one PR per repo. |
 | `/review-pr [pr]` | First-pass PR review. local-big reads the diff and CI output, local-embed checks that nothing consuming a changed contract was missed, and you get findings grouped Blocking / Should fix / Nit with `file:line` citations. Defaults to the current branch's PR. |
 | `/harness-init [path]` | Agentic setup. Asks the same six questions as `bin/init`, runs it non-interactively, then scans the repos and drafts `config/workspace-context.md` for approval instead of asking a human to write an ecosystem map from a blank page. |
+| `/delegate <repo> <task>` | Hand a scoped task to a frontier Codex session in one configured repo via the delegate MCP server. Metered spend on the user's OpenAI subscription, always journaled; the command file spells out when delegation earns its cost. |
 
 All three name only the aliases `local-big`, `local-fast`, and `local-embed`,
 and reach the models through the MCP tools `compress_context`,

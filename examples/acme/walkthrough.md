@@ -239,6 +239,10 @@ Frontier usage (Claude Code transcripts)
   total 230,400
 ```
 
+Had the agent also delegated a task (say, handing `acme-web` to a Codex session via the
+`delegate` tool while it worked `acme-api` itself), those calls would appear here too as
+`route=frontier` rows under tool `delegate` — metered spend is never off the books.
+
 Read it in this order:
 
 1. **`FALLBACK INVOCATIONS: 0`.** Nothing silently escaped to a paid endpoint that was

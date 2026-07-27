@@ -184,12 +184,32 @@ the offload tools switched off, so you have a number to compare against.
 disabled — deleted. An offload tool nobody reaches for is a tool that costs context in
 every prompt describing it and returns nothing.
 
+### Frontier delegation (the opposite trade, made explicit)
+
+The delegate MCP server (`mcp/delegate-server/`) is the one deliberate exception to
+"conserve frontier tokens": it hands a scoped task to a Codex CLI session on your own
+OpenAI subscription. It exists for three cases — parallel multi-repo work (your main agent
+keeps repo A, Codex takes repo B), a second frontier model's opinion on a cross-repo
+contract, and overflow when you are context- or rate-limited.
+
+The same honesty rules apply, harder: sessions are pinned to one configured repo, edit
+sessions require a clean tracked tree and return a diff summary, and every call is logged
+to the usage journal as `route="frontier"` with Codex's own token counts. Measured while
+building it: a trivial delegated review costs ~36k input tokens. Delegation is never
+routed automatically and never free — `usage-report` shows exactly what it cost, and the
+kill rule applies to it like everything else.
+
 ### What NOT to build
 
 - **No automatic router.** Explicit invocation only. Revisit in 3 months if the explicit
   version proves itself.
 - **No local model as primary coding agent.** They compress, search, and draft; frontier
-  models reason and implement.
+  models reason and implement. Measured, not dogma: on this class of hardware a local
+  agentic loop means 12–18s per warm call on a 14B model, and reasoning-tuned local models
+  return empty strings once their token budget goes to thinking. Revisit on a 128GB
+  machine with a resident 70B, a task that has repeated three times, and a deterministic
+  verifier — not before. (Frontier delegation via the delegate server is a different
+  trade and exists today.)
 - **No more than two chat models + one embedding model** resident.
 - **No custom UI/dashboard.** Terminal output from `usage-report` is enough.
 - **No mandatory context updates on every PR.** Friction-triggered only.
@@ -220,9 +240,10 @@ agent-harness/
 │   └── tier-overrides.yaml     optional per-team model pins
 ├── var/                        RUNTIME state; gitignored: usage.jsonl, litellm.log, pid file
 ├── litellm/profiles/           128gb.yaml / 64gb.yaml / 32gb.yaml -- chosen by detected RAM
-├── mcp/offload-server/         compress_context, workspace_search, draft
+├── mcp/offload-server/         compress_context, workspace_search, draft (local, free)
+├── mcp/delegate-server/        delegate, delegate_reply -- frontier Codex handoff (metered)
 ├── claude/
-│   ├── commands/               fix-issue.md, review-pr.md, harness-init.md
+│   ├── commands/               fix-issue.md, review-pr.md, harness-init.md, delegate.md
 │   ├── hooks/                  post-edit-lint.sh, commit-msg-local.sh
 │   ├── mcp.json.template       rendered by bin/init into <workspace>/.mcp.json
 │   └── settings.template.json  rendered by bin/init into <workspace>/.claude/settings.json
@@ -253,12 +274,14 @@ Every script takes `--help`, and the help text is the reference.
 | `/harness-init` | Agentic setup: asks the wizard's questions, then **scans your actual repos** and drafts `workspace-context.md` for you to edit. The highest-leverage ten minutes of setup. |
 | `/fix-issue <issue>` | Fix an issue across every repo in the workspace: search for blast radius, compress logs, state the cross-repo plan, implement, test, per-repo PRs. |
 | `/review-pr <pr>` | `local-big` does the first pass (style, obvious bugs, missing tests); you and the frontier model read only the distilled findings. |
+| `/delegate <repo> <task>` | Hand a scoped task to a frontier Codex session in one repo — parallel multi-repo work, second opinions, overflow. Metered and journaled. |
 
 | MCP tool | Alias | Job |
 |---|---|---|
 | `compress_context` | `local-big` | Summarize logs, test output, large diffs, and long docs into a tight brief *before* the frontier model reads them |
 | `workspace_search` | `local-embed` | Semantic search across every repo; returns file paths plus relevant snippets |
 | `draft` | `local-fast` | Commit messages, PR descriptions, changelog entries, test boilerplate |
+| `delegate` / `delegate_reply` | Codex (frontier) | Hand a scoped task to a Codex session in one repo; metered, journaled, diff-summarized |
 
 Three tools. Adding a fourth needs a reason stronger than "it seemed useful."
 
