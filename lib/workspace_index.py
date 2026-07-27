@@ -279,8 +279,20 @@ def _resolve_workspace(workspace_root: Path) -> Path:
     return root.resolve()
 
 
-def _discover_repos(root: Path, repos: Sequence[str] | None) -> list[tuple[str, Path]]:
-    """Repo name -> directory. A workspace that is itself a repo counts as one."""
+def _discover_repos(
+    root: Path,
+    repos: Sequence[str] | None,
+    progress: Callable[[str], None] | None = None,
+) -> list[tuple[str, Path]]:
+    """Repo name -> directory. A workspace that is itself a repo counts as one.
+
+    When the caller does not name repos, ``config/repos.yaml`` is the filter:
+    a workspace root is often a directory that also holds unrelated checkouts,
+    and indexing those pollutes every search while costing minutes of
+    embedding time. Explicitly named repos are strict (unknown -> error);
+    the config default is lenient (a configured-but-not-cloned repo is
+    reported and skipped, so one missing clone never blocks the rest).
+    """
     found: list[tuple[str, Path]] = []
     if (root / ".git").exists():
         found.append((root.name, root))
@@ -293,6 +305,27 @@ def _discover_repos(root: Path, repos: Sequence[str] | None) -> list[tuple[str, 
             f"no repos found under {root}. Clone them with `bin/sync-workspace`, "
             "or point `workspace_root` at the right directory."
         )
+    if not repos:
+        try:
+            configured = [str(r.get("name") or "").strip() for r in h.load_repos()]
+        except h.HarnessError:
+            configured = []
+        configured = [n for n in configured if n]
+        if configured:
+            by_name = dict(found)
+            missing = sorted(set(configured) - by_name.keys())
+            if missing and progress:
+                progress(
+                    "configured but not cloned (skipped): " + ", ".join(missing)
+                    + " -- run bin/sync-workspace"
+                )
+            kept = [(n, p) for n, p in found if n in set(configured)]
+            if kept:
+                return kept
+            raise h.HarnessError(
+                f"none of the repos in config/repos.yaml exist under {root}. "
+                "Run `bin/sync-workspace` to clone them."
+            )
     if repos:
         wanted = {r.strip() for r in repos if r and r.strip()}
         by_name = dict(found)
@@ -512,7 +545,7 @@ def build_index(
     stats = IndexStats()
     scheme = _embed_scheme()
 
-    targets = _discover_repos(root, repos)
+    targets = _discover_repos(root, repos, progress=say)
     conn = _connect()
     try:
         # The database is bound to one workspace root; pointing the harness at
@@ -541,6 +574,24 @@ def build_index(
                 conn.executemany("DELETE FROM files WHERE repo = ?", [(n,) for n in scope])
             conn.execute("DELETE FROM chunks WHERE file_id NOT IN (SELECT id FROM files)")
             conn.commit()
+
+        if not repos:
+            # A no-filter build indexes the whole intended workspace, so any
+            # stored repo outside the target set has been de-scoped (removed
+            # from config/repos.yaml, or swept in by an older unscoped build).
+            # Purge it here; a partial `repos=[...]` build never purges.
+            keep = {name for name, _ in targets}
+            stale = sorted(
+                r for (r,) in conn.execute("SELECT DISTINCT repo FROM files")
+                if r not in keep
+            )
+            if stale:
+                say("dropping de-scoped repo(s) from index: " + ", ".join(stale))
+                conn.executemany("DELETE FROM files WHERE repo = ?", [(r,) for r in stale])
+                conn.execute(
+                    "DELETE FROM chunks WHERE file_id NOT IN (SELECT id FROM files)"
+                )
+                conn.commit()
 
         _meta_set(conn, "workspace_root", str(root))
         _meta_set(conn, "schema_version", str(SCHEMA_VERSION))
