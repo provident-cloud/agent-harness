@@ -1,0 +1,42 @@
+# Secrets and environment for the agent harness (direnv).
+#
+#   cp .envrc.template .envrc
+#   $EDITOR .envrc
+#   direnv allow
+#
+# .envrc is gitignored. Never put a real key in this template -- it is public.
+# If you do not use direnv, exporting these in your shell profile works just as well;
+# the harness only reads environment variables.
+
+# --- Hosted open-source rung -------------------------------------------------
+# Any OpenAI-compatible endpoint: Mixlayer, Together, Fireworks, OpenRouter.
+# The worked example throughout the docs is Mixlayer.
+#
+# REQUIRED on the 32GB tier: local-big is hosted there, and without a key it falls
+# back to a degraded local model that drops details when summarizing.
+# Optional on 64GB/128GB, where it is only the fallback rung -- but set it anyway,
+# or a crashed Ollama takes your session down with it.
+export OSS_API_BASE="https://models.mixlayer.ai/v1"
+export OSS_API_KEY=""
+
+# --- Frontier provider -------------------------------------------------------
+# ALWAYS optional, on every tier. Claude Code and Codex authenticate themselves;
+# this is only needed if you wire a frontier model into a harness path explicitly.
+export ANTHROPIC_API_KEY=""
+
+# --- LiteLLM proxy -----------------------------------------------------------
+# Auth for the local proxy on 127.0.0.1:4000. The harness defaults to
+# sk-harness-local when this is unset, so leaving it alone works. Change it if
+# the proxy will ever listen on anything other than loopback.
+export LITELLM_MASTER_KEY="sk-harness-local"
+
+# How long Ollama keeps a model resident after its last request. Match your tier:
+#   128GB -> 30m   64GB -> 15m   32GB -> 2m
+# Lower means models unload instead of competing with Docker and your IDE;
+# higher means you stop paying the reload cost on every request.
+export OLLAMA_KEEP_ALIVE="2m"
+
+# --- Harness location --------------------------------------------------------
+# Lets the MCP server and bin/ scripts find this checkout when launched from
+# anywhere else (agents run from the workspace root, not from here).
+export HARNESS_ROOT="$PWD"

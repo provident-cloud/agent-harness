@@ -1,0 +1,46 @@
+# Non-interactive input for `bin/init --answers` (schema: `bin/init --help`).
+#
+#   bin/init --answers examples/acme/answers.yaml
+#
+# This is the file you hand a new teammate so their machine ends up configured
+# the same way yours is. It is also what the interactive wizard collects --
+# `bin/init --print-answers` writes this exact shape back out.
+#
+# Acme is fictional. Copy it, change the names, keep the shape.
+version: 1
+
+team: acme
+
+# Where the sibling checkouts live. bin/sync-workspace clones into this
+# directory and agents run from it. `~` is expanded at read time.
+workspace_root: ~/workspace/acme
+
+# auto = re-detect from installed RAM on every run, which is what lets this
+# file work unchanged on a 32GB laptop and a 128GB desktop. Pin 128gb / 64gb /
+# 32gb only to force a profile.
+tier: auto
+
+repos:
+  - name: acme-api
+    remote: git@github.com:acme/acme-api.git
+    branch: main
+    description: Go REST API over Postgres. Owns the OpenAPI schema both repos build against.
+  - name: acme-web
+    remote: git@github.com:acme/acme-web.git
+    branch: main
+    description: TypeScript/React frontend. Consumes acme-api through a generated client.
+
+# Hosted open-source rung: any OpenAI-compatible endpoint. Required on the 32GB
+# tier, where local-big is hosted; the fallback rung on every other tier.
+# The key itself never lives here -- only the name of the variable holding it.
+oss:
+  enabled: true
+  base_url: https://models.mixlayer.ai/v1
+  api_key_env: OSS_API_KEY
+
+# Frontier keys are always optional. Claude Code and Codex authenticate
+# themselves; this matters only if you wire a frontier model into a harness
+# path explicitly. Acme does not.
+frontier:
+  enabled: false
+  api_key_env: ANTHROPIC_API_KEY

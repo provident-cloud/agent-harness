@@ -1,0 +1,86 @@
+# LiteLLM profile -- 32GB tier (under 48GB detected RAM).
+#
+# setup.sh selects this file automatically from detected RAM; `./setup.sh --tier 32gb`
+# forces it. Concrete model tags live here and in lib/harness_lib.py DEFAULT_MODELS and
+# nowhere else -- to pin different models for your team, edit config/tier-overrides.yaml
+# rather than this file, so upstream updates keep merging cleanly.
+#
+# Intended OLLAMA_KEEP_ALIVE for this tier: 2m. On a 32GB machine the models compete
+# with Docker, the IDE, and the browser, so they unload almost immediately after use.
+#
+# This tier makes one deliberate trade the others do not: local-big is HOSTED.
+# A weak local summarizer that quietly drops details costs more than it saves -- you
+# pay for it later in re-reads and wrong frontier decisions, which is more expensive
+# than fractions of a cent per compression. So this tier requires OSS_API_KEY.
+# Everything else (search, embeddings, commit messages, drafts) stays free and local.
+
+model_list:
+  # Workhorse: hosted, same model family the high tiers run locally, so prompts and
+  # output quality stay comparable across hardware.
+  - model_name: local-big
+    litellm_params:
+      model: openai/qwen2.5-72b-instruct
+      api_base: os.environ/OSS_API_BASE
+      api_key: os.environ/OSS_API_KEY
+    model_info:
+      mode: chat
+
+  # Same hosted model under the ladder's name, so the fallback contract is identical
+  # on every tier and downstream code never special-cases 32GB.
+  - model_name: local-big-remote
+    litellm_params:
+      model: openai/qwen2.5-72b-instruct
+      api_base: os.environ/OSS_API_BASE
+      api_key: os.environ/OSS_API_KEY
+    model_info:
+      mode: chat
+
+  # The no-key path, and only that. It will swap hard and drop details on long
+  # inputs -- setup.sh warns loudly when this is what you are actually getting.
+  # Point local-big here in config/tier-overrides.yaml if you truly must stay offline.
+  #
+  # Deliberately a mid-size non-reasoning model rather than the largest tag that
+  # fits. A thinking model spends its whole token budget reasoning and returns an
+  # empty string to the caller, and a 23GB resident model evicts everything else
+  # on a 32GB machine. Compression wants an immediate answer, not deliberation.
+  - model_name: local-big-degraded
+    litellm_params:
+      model: ollama/qwen2.5-coder:14b
+      api_base: http://127.0.0.1:11434
+      keep_alive: 2m
+    model_info:
+      mode: chat
+
+  # Sprinter: commit messages, classification, boilerplate. Small enough to load,
+  # answer, and unload without disturbing anything else on the machine.
+  - model_name: local-fast
+    litellm_params:
+      model: ollama/qwen2.5-coder:7b
+      api_base: http://127.0.0.1:11434
+      keep_alive: 2m
+    model_info:
+      mode: chat
+
+  - model_name: local-embed
+    litellm_params:
+      model: ollama/nomic-embed-text
+      api_base: http://127.0.0.1:11434
+      keep_alive: 2m
+    model_info:
+      mode: embedding
+
+litellm_settings:
+  # The full ladder for this tier: hosted primary -> hosted remote -> local degraded.
+  # The last rung is what keeps a keyless 32GB machine usable instead of dead. It is
+  # last on purpose: reaching it means every hosted rung failed, so compression
+  # quality has silently dropped and `bin/usage-report` should be showing a fallback
+  # count. Treat a nonzero count here as "buy the OSS key", not as normal operation.
+  fallbacks:
+    - local-big: [local-big-remote, local-big-degraded]
+  drop_params: true
+
+general_settings:
+  # setup.sh exports LITELLM_MASTER_KEY=sk-harness-local when it is unset, so the
+  # default path works with no secrets configured. Set your own in .envrc if the
+  # proxy will ever listen on anything but the loopback address.
+  master_key: os.environ/LITELLM_MASTER_KEY

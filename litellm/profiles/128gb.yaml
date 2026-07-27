@@ -1,0 +1,62 @@
+# LiteLLM profile -- 128GB tier (>= 96GB detected RAM).
+#
+# setup.sh selects this file automatically from detected RAM; `./setup.sh --tier 128gb`
+# forces it. Concrete model tags live here and in lib/harness_lib.py DEFAULT_MODELS and
+# nowhere else -- to pin different models for your team, edit config/tier-overrides.yaml
+# rather than this file, so upstream updates keep merging cleanly.
+#
+# Intended OLLAMA_KEEP_ALIVE for this tier: 30m. There is headroom to keep the 70B
+# workhorse resident all day, so pay the load cost once.
+
+model_list:
+  # Workhorse: summarization, first-pass review, anything long and low-judgment.
+  - model_name: local-big
+    litellm_params:
+      model: ollama/llama3.3:70b
+      api_base: http://127.0.0.1:11434
+      keep_alive: 30m
+    model_info:
+      mode: chat
+
+  # Fallback target for local-big (see litellm_settings below). Any OpenAI-compatible
+  # host works -- Mixlayer, Together, Fireworks, OpenRouter -- via OSS_API_BASE.
+  - model_name: local-big-remote
+    litellm_params:
+      model: openai/qwen2.5-72b-instruct
+      api_base: os.environ/OSS_API_BASE
+      api_key: os.environ/OSS_API_KEY
+    model_info:
+      mode: chat
+
+  # Sprinter: commit messages, classification, boilerplate. Sized to sit in memory
+  # alongside the workhorse without evicting it.
+  - model_name: local-fast
+    litellm_params:
+      model: ollama/qwen2.5-coder:14b
+      api_base: http://127.0.0.1:11434
+      keep_alive: 30m
+    model_info:
+      mode: chat
+
+  - model_name: local-embed
+    litellm_params:
+      model: ollama/nomic-embed-text
+      api_base: http://127.0.0.1:11434
+      keep_alive: 30m
+    model_info:
+      mode: embedding
+
+litellm_settings:
+  # Fallback ladder: local Ollama -> hosted OSS. An unloaded model or a crashed
+  # Ollama degrades to the hosted rung instead of failing mid-session. Fallbacks
+  # that fire are counted by bin/usage-report -- silent metered usage is the one
+  # cost this design can hide from you.
+  fallbacks:
+    - local-big: [local-big-remote]
+  drop_params: true
+
+general_settings:
+  # setup.sh exports LITELLM_MASTER_KEY=sk-harness-local when it is unset, so the
+  # default path works with no secrets configured. Set your own in .envrc if the
+  # proxy will ever listen on anything but the loopback address.
+  master_key: os.environ/LITELLM_MASTER_KEY

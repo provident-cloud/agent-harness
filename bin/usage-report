@@ -1,0 +1,850 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""Where the tokens went: offload journal + frontier transcript accounting."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import harness_lib as h
+
+# Claude Code writes one JSONL transcript per session under here. Nothing in the
+# harness owns this directory, so every read is best-effort and read-only.
+TRANSCRIPT_ROOT = Path.home() / ".claude" / "projects"
+
+ROUTES = ("local", "remote", "frontier")
+
+# --------------------------------------------------------------------------
+# Terminal helpers. Tables go to stdout (they are the payload); progress and
+# warnings go to stderr via harness_lib.
+# --------------------------------------------------------------------------
+
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _b(text: str) -> str:
+    return f"\033[1m{text}\033[0m" if _COLOR else text
+
+
+def _d(text: str) -> str:
+    return f"\033[2m{text}\033[0m" if _COLOR else text
+
+
+def heading(text: str) -> None:
+    print()
+    print(_b(text))
+    print(_d("-" * len(text)))
+
+
+def num(value: Any) -> str:
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def table(headers: list[str], rows: list[list[str]], *, align_right: Iterable[int] = ()) -> None:
+    """Print an aligned plain-text table. Empty rows print a dim placeholder."""
+    if not rows:
+        print(_d("  (nothing in window)"))
+        return
+    right = set(align_right)
+    widths = [len(hdr) for hdr in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt(cells: list[str]) -> str:
+        parts = []
+        for i, cell in enumerate(cells):
+            parts.append(cell.rjust(widths[i]) if i in right else cell.ljust(widths[i]))
+        return "  " + "  ".join(parts).rstrip()
+
+    print(_b(fmt(headers)))
+    print(_d(fmt(["-" * w for w in widths])))
+    for row in rows:
+        print(fmt(row))
+
+
+def pct(part: int, whole: int) -> str:
+    return f"{100.0 * part / whole:.1f}%" if whole else "-"
+
+
+def percentile(values: list[float], q: float) -> int | None:
+    """Nearest-rank percentile. Small samples make interpolation dishonest."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = max(0, min(len(ordered) - 1, int(round(q * (len(ordered) - 1)))))
+    return int(ordered[idx])
+
+
+def ms(value: int | None) -> str:
+    return "-" if value is None else f"{value:,}"
+
+
+# --------------------------------------------------------------------------
+# Window
+# --------------------------------------------------------------------------
+
+
+def parse_since(value: str) -> datetime:
+    text = value.strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise h.HarnessError(
+            f"cannot parse --since {value!r}; use YYYY-MM-DD or a full ISO timestamp"
+        ) from exc
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def parse_ts(value: Any) -> datetime | None:
+    """Parse a journal or transcript timestamp; None when unusable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+# --------------------------------------------------------------------------
+# Source 1: the offload journal (var/usage.jsonl)
+# --------------------------------------------------------------------------
+
+
+def _blank_bucket() -> dict[str, Any]:
+    return {
+        "calls": 0,
+        "ok": 0,
+        "failed": 0,
+        "fallbacks": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "durations": [],
+    }
+
+
+def _absorb(bucket: dict[str, Any], row: dict[str, Any]) -> None:
+    bucket["calls"] += 1
+    if row.get("ok"):
+        bucket["ok"] += 1
+    else:
+        bucket["failed"] += 1
+    if row.get("fallback"):
+        bucket["fallbacks"] += 1
+    for key in ("prompt_tokens", "completion_tokens"):
+        try:
+            bucket[key] += int(row.get(key) or 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        bucket["durations"].append(float(row["duration_ms"]))
+    except (KeyError, TypeError, ValueError):
+        pass
+
+
+def _finish(bucket: dict[str, Any]) -> dict[str, Any]:
+    durations = bucket.pop("durations")
+    bucket["total_tokens"] = bucket["prompt_tokens"] + bucket["completion_tokens"]
+    bucket["p50_ms"] = percentile(durations, 0.50)
+    bucket["p95_ms"] = percentile(durations, 0.95)
+    bucket["success_rate"] = (bucket["ok"] / bucket["calls"]) if bucket["calls"] else None
+    return bucket
+
+
+def summarize_offload(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    overall = _blank_bucket()
+    by_alias: dict[str, dict[str, Any]] = defaultdict(_blank_bucket)
+    by_tool: dict[str, dict[str, Any]] = defaultdict(_blank_bucket)
+    by_route: dict[str, dict[str, Any]] = defaultdict(_blank_bucket)
+    by_tool_alias: dict[tuple[str, str], dict[str, Any]] = defaultdict(_blank_bucket)
+    by_day: dict[str, dict[str, Any]] = defaultdict(_blank_bucket)
+    fallback_pairs: dict[tuple[str, str], int] = defaultdict(int)
+
+    for row in rows:
+        alias = str(row.get("alias") or "?")
+        tool = str(row.get("tool") or "?")
+        # A failed call never reached a model, so it has no route of its own.
+        route = str(row.get("route") or ("unknown" if row.get("ok") else "failed"))
+        _absorb(overall, row)
+        _absorb(by_alias[alias], row)
+        _absorb(by_tool[tool], row)
+        _absorb(by_route[route], row)
+        _absorb(by_tool_alias[(tool, alias)], row)
+        ts = parse_ts(row.get("ts"))
+        if ts:
+            _absorb(by_day[ts.astimezone(timezone.utc).date().isoformat()], row)
+        if row.get("fallback"):
+            fallback_pairs[(alias, str(row.get("model_resolved") or "?"))] += 1
+
+    return {
+        "rows": len(rows),
+        "overall": _finish(overall),
+        "by_alias": {k: _finish(v) for k, v in sorted(by_alias.items())},
+        "by_tool": {k: _finish(v) for k, v in sorted(by_tool.items())},
+        "by_route": {k: _finish(v) for k, v in sorted(by_route.items())},
+        "by_tool_alias": {
+            f"{t}/{a}": _finish(v) for (t, a), v in sorted(by_tool_alias.items())
+        },
+        "by_day": {k: _finish(v) for k, v in sorted(by_day.items())},
+        "fallback_targets": {f"{a} -> {m}": n for (a, m), n in sorted(fallback_pairs.items())},
+        "failures": [
+            {"ts": r.get("ts"), "tool": r.get("tool"), "alias": r.get("alias"),
+             "detail": str(r.get("detail") or "")[:120]}
+            for r in rows
+            if not r.get("ok")
+        ][-10:],
+    }
+
+
+def print_offload(data: dict[str, Any], *, by_tool: bool) -> None:
+    overall = data["overall"]
+    heading("Offload usage (var/usage.jsonl)")
+    if not data["rows"]:
+        print(_d("  no offload calls in window."))
+        print(_d("  Nothing has called local-big / local-fast / local-embed yet, or the"))
+        print(_d("  journal was rotated. The MCP tools and bin/local write it automatically."))
+        return
+
+    print(
+        f"  calls {num(overall['calls'])}   "
+        f"ok {num(overall['ok'])}   "
+        f"failed {num(overall['failed'])}   "
+        f"success {pct(overall['ok'], overall['calls'])}"
+    )
+    print(
+        f"  tokens in {num(overall['prompt_tokens'])}   "
+        f"out {num(overall['completion_tokens'])}   "
+        f"total {num(overall['total_tokens'])}"
+    )
+    print(f"  latency p50 {ms(overall['p50_ms'])} ms   p95 {ms(overall['p95_ms'])} ms")
+
+    # The headline number. A proxy that quietly falls back all day looks healthy
+    # in every other column and only shows up here -- and later on the invoice.
+    fallbacks = overall["fallbacks"]
+    line = f"  FALLBACK INVOCATIONS: {num(fallbacks)} of {num(overall['calls'])} calls " \
+           f"({pct(fallbacks, overall['calls'])})"
+    print()
+    print(_b(line))
+    if fallbacks:
+        for target, count in data["fallback_targets"].items():
+            print(f"    {target}: {num(count)}")
+        print(
+            _d("    A fallback means LiteLLM answered with something other than the alias")
+        )
+        print(
+            _d("    you asked for. If this is not near zero, the local rung is not carrying")
+        )
+        print(_d("    the load you think it is."))
+    else:
+        print(_d("    Clean: every call was served by the alias that was asked for."))
+
+    heading("By route (metered calls are the ones that cost money)")
+    rows = []
+    for route in list(ROUTES) + [r for r in data["by_route"] if r not in ROUTES]:
+        bucket = data["by_route"].get(route)
+        if not bucket:
+            continue
+        rows.append([
+            route,
+            num(bucket["calls"]),
+            num(bucket["prompt_tokens"]),
+            num(bucket["completion_tokens"]),
+            num(bucket["total_tokens"]),
+            ms(bucket["p50_ms"]),
+            ms(bucket["p95_ms"]),
+        ])
+    table(
+        ["route", "calls", "tok in", "tok out", "tok total", "p50 ms", "p95 ms"],
+        rows,
+        align_right=range(1, 7),
+    )
+    metered = sum(
+        data["by_route"].get(r, {}).get("calls", 0) for r in ("remote", "frontier")
+    )
+    print(_d(f"  metered (remote + frontier): {num(metered)} calls"))
+
+    heading("By alias")
+    table(
+        ["alias", "calls", "ok", "fail", "fallback", "tok in", "tok out", "p50 ms", "p95 ms"],
+        [
+            [
+                alias,
+                num(b["calls"]),
+                num(b["ok"]),
+                num(b["failed"]),
+                num(b["fallbacks"]),
+                num(b["prompt_tokens"]),
+                num(b["completion_tokens"]),
+                ms(b["p50_ms"]),
+                ms(b["p95_ms"]),
+            ]
+            for alias, b in data["by_alias"].items()
+        ],
+        align_right=range(1, 9),
+    )
+
+    heading("By tool")
+    table(
+        ["tool", "calls", "ok", "fail", "fallback", "tok total", "p50 ms", "p95 ms"],
+        [
+            [
+                tool,
+                num(b["calls"]),
+                num(b["ok"]),
+                num(b["failed"]),
+                num(b["fallbacks"]),
+                num(b["total_tokens"]),
+                ms(b["p50_ms"]),
+                ms(b["p95_ms"]),
+            ]
+            for tool, b in data["by_tool"].items()
+        ],
+        align_right=range(1, 8),
+    )
+    # Phase 3's kill rule: an offload path with zero invocations for two weeks
+    # gets deleted. Only the report can tell you which one that is.
+    print(_d("  Kill rule: any offload path with zero invocations in 2 weeks gets deleted."))
+
+    if by_tool:
+        heading("By tool x alias")
+        table(
+            ["tool / alias", "calls", "ok", "fail", "fallback", "tok total", "p50 ms"],
+            [
+                [
+                    key,
+                    num(b["calls"]),
+                    num(b["ok"]),
+                    num(b["failed"]),
+                    num(b["fallbacks"]),
+                    num(b["total_tokens"]),
+                    ms(b["p50_ms"]),
+                ]
+                for key, b in data["by_tool_alias"].items()
+            ],
+            align_right=range(1, 7),
+        )
+    else:
+        print(_d("  (--by-tool adds the tool x alias breakdown)"))
+
+    if data["failures"]:
+        heading("Recent failures")
+        table(
+            ["when", "tool", "alias", "detail"],
+            [
+                [str(f["ts"] or "-"), str(f["tool"] or "-"), str(f["alias"] or "-"), f["detail"]]
+                for f in data["failures"]
+            ],
+        )
+
+
+# --------------------------------------------------------------------------
+# Source 2: Claude Code transcripts (best effort, read-only)
+# --------------------------------------------------------------------------
+
+TOKEN_FIELDS = (
+    ("input_tokens", "input"),
+    ("output_tokens", "output"),
+    ("cache_read_input_tokens", "cache_read"),
+    ("cache_creation_input_tokens", "cache_creation"),
+)
+
+
+def _blank_tokens() -> dict[str, int]:
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "total": 0,
+            "messages": 0}
+
+
+def _add_usage(bucket: dict[str, int], usage: dict[str, Any]) -> int:
+    added = 0
+    for src, dst in TOKEN_FIELDS:
+        try:
+            value = int(usage.get(src) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        bucket[dst] += value
+        added += value
+    bucket["total"] += added
+    bucket["messages"] += 1
+    return added
+
+
+def _is_user_turn(record: dict[str, Any]) -> bool:
+    """A human turn: a user record that is not a tool result and not meta.
+
+    This is the closest honest proxy for "turns to completion" -- the number of
+    times a person had to say something before the task was done.
+    """
+    if record.get("type") != "user" or record.get("isMeta") or record.get("isSidechain"):
+        return False
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return not any(
+            isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+        )
+    return False
+
+
+def _split_path(root: Path, path: Path) -> tuple[str, str, bool]:
+    """(project directory, session id, is-the-main-transcript) for a transcript.
+
+    Layout: ``<project>/<session>.jsonl`` for a session, and
+    ``<project>/<session>/subagents/[workflows/<wf>/]<agent>.jsonl`` for the
+    subagents it spawned. Subagent spend is part of the session that spawned it,
+    so it rolls up into the same bucket.
+    """
+    parts = path.relative_to(root).parts
+    project_dir = parts[0]
+    if len(parts) == 2:
+        return project_dir, Path(parts[1]).stem, True
+    return project_dir, parts[1], False
+
+
+def scan_transcripts(since: datetime, root: Path = TRANSCRIPT_ROOT) -> dict[str, Any]:
+    """Sum assistant `usage` objects per day / project / session.
+
+    Deliberately forgiving: transcripts are an internal format owned by another
+    program. Anything unparseable is skipped, never guessed at.
+    """
+    result: dict[str, Any] = {
+        "available": False,
+        "reason": None,
+        "root": str(root),
+        "files_found": 0,
+        "files_scanned": 0,
+        "files_unreadable": 0,
+        "subagent_files": 0,
+        "lines_skipped": 0,
+        "by_day": {},
+        "by_project": {},
+        "sessions": {},
+    }
+    if not root.is_dir():
+        result["reason"] = f"no transcript directory at {root}"
+        return result
+
+    files = sorted(p for p in root.rglob("*.jsonl") if len(p.relative_to(root).parts) >= 2)
+    if not files:
+        result["reason"] = f"no *.jsonl transcripts under {root}"
+        return result
+    result["files_found"] = len(files)
+
+    by_day: dict[str, dict[str, int]] = defaultdict(_blank_tokens)
+    by_project: dict[str, dict[str, int]] = defaultdict(_blank_tokens)
+    sessions: dict[str, dict[str, Any]] = {}
+    day_sessions: dict[str, set[str]] = defaultdict(set)
+    project_sessions: dict[str, set[str]] = defaultdict(set)
+    # Project directories are the caller's cwd with separators mangled, so label
+    # them from the first cwd a main transcript reports. Fall back to the raw
+    # directory name rather than guessing how to un-mangle it.
+    labels: dict[str, str] = {}
+
+    for path in files:
+        project_dir, session_id, is_main = _split_path(root, path)
+        session_key = f"{project_dir}/{session_id}"
+        try:
+            # mtime is the last append, so an older file cannot hold newer rows.
+            if datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) < since:
+                continue
+            handle = path.open(errors="replace")
+        except OSError:
+            result["files_unreadable"] += 1
+            continue
+        result["files_scanned"] += 1
+        if not is_main:
+            result["subagent_files"] += 1
+
+        # Each API response can appear on several lines (one per content block).
+        # Dedupe on the assistant message id or the tokens are counted twice.
+        seen_ids: set[str] = set()
+        with handle as fh:
+            for line in fh:  # streamed: these files reach hundreds of MB
+                line = line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    result["lines_skipped"] += 1
+                    continue
+                if not isinstance(record, dict):
+                    result["lines_skipped"] += 1
+                    continue
+
+                if is_main and project_dir not in labels:
+                    cwd = record.get("cwd")
+                    if isinstance(cwd, str) and cwd.strip():
+                        labels[project_dir] = Path(cwd).name or project_dir
+
+                ts = parse_ts(record.get("timestamp"))
+                if ts is None or ts < since:
+                    continue
+
+                entry = sessions.get(session_key)
+                if entry is None:
+                    entry = sessions[session_key] = {
+                        "project_dir": project_dir,
+                        "first": ts.isoformat(),
+                        "last": ts.isoformat(),
+                        "turns": 0,
+                        "tokens": _blank_tokens(),
+                    }
+                if ts.isoformat() < entry["first"]:
+                    entry["first"] = ts.isoformat()
+                entry["last"] = max(entry["last"], ts.isoformat())
+
+                # Only the main transcript has human turns; a subagent's "user"
+                # records are the orchestrator talking to it.
+                if is_main and _is_user_turn(record):
+                    entry["turns"] += 1
+
+                if record.get("type") != "assistant":
+                    continue
+                message = record.get("message")
+                if not isinstance(message, dict):
+                    continue
+                usage = message.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                msg_id = message.get("id")
+                if isinstance(msg_id, str) and msg_id:
+                    if msg_id in seen_ids:
+                        continue
+                    seen_ids.add(msg_id)
+
+                day = ts.astimezone(timezone.utc).date().isoformat()
+                _add_usage(by_day[day], usage)
+                _add_usage(by_project[project_dir], usage)
+                _add_usage(entry["tokens"], usage)
+                day_sessions[day].add(session_key)
+                project_sessions[project_dir].add(session_key)
+
+    for day, bucket in by_day.items():
+        bucket["sessions"] = len(day_sessions[day])
+    for project_dir, bucket in by_project.items():
+        bucket["sessions"] = len(project_sessions[project_dir])
+
+    # Drop sessions that had activity in the window but no billable messages --
+    # resumed-and-abandoned sessions would otherwise drag the per-task medians.
+    sessions = {k: v for k, v in sessions.items() if v["tokens"]["messages"]}
+    for entry in sessions.values():
+        entry["project"] = labels.get(entry["project_dir"], entry["project_dir"])
+
+    result["available"] = True
+    result["by_day"] = dict(sorted(by_day.items()))
+    result["by_project"] = {
+        labels.get(k, k): v
+        for k, v in sorted(by_project.items(), key=lambda kv: -kv[1]["total"])
+    }
+    result["sessions"] = sessions
+    return result
+
+
+def weekly_trend(sessions: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Aggregate sessions into ISO weeks so a baseline week is comparable."""
+    weeks: dict[str, dict[str, Any]] = {}
+    for entry in sessions.values():
+        ts = parse_ts(entry["first"])
+        if ts is None:
+            continue
+        year, week, _ = ts.astimezone(timezone.utc).isocalendar()
+        key = f"{year}-W{week:02d}"
+        bucket = weeks.setdefault(
+            key, {"sessions": 0, "turns": 0, "tokens": 0, "output_tokens": 0, "turn_list": [],
+                  "token_list": []}
+        )
+        bucket["sessions"] += 1
+        bucket["turns"] += entry["turns"]
+        bucket["tokens"] += entry["tokens"]["total"]
+        bucket["output_tokens"] += entry["tokens"]["output"]
+        bucket["turn_list"].append(entry["turns"])
+        bucket["token_list"].append(entry["tokens"]["total"])
+    for bucket in weeks.values():
+        bucket["median_turns"] = int(statistics.median(bucket.pop("turn_list") or [0]))
+        bucket["median_tokens"] = int(statistics.median(bucket.pop("token_list") or [0]))
+    return dict(sorted(weeks.items()))
+
+
+def print_frontier(data: dict[str, Any]) -> None:
+    heading("Frontier usage (Claude Code transcripts)")
+    if not data["available"]:
+        print("  frontier transcript data unavailable")
+        print(_d(f"  {data['reason']}"))
+        return
+    if not data["by_day"]:
+        print("  frontier transcript data unavailable")
+        print(
+            _d(
+                f"  {data['files_found']} transcript file(s) found, none with usage inside "
+                "the window."
+            )
+        )
+        return
+
+    totals = _blank_tokens()
+    for bucket in data["by_day"].values():
+        for key in ("input", "output", "cache_read", "cache_creation", "total", "messages"):
+            totals[key] += bucket[key]
+    print(
+        f"  assistant messages {num(totals['messages'])} across "
+        f"{num(len(data['sessions']))} session(s)"
+    )
+    print(
+        _d(
+            f"  read {num(data['files_scanned'])} of {num(data['files_found'])} transcript "
+            f"file(s) ({num(data['subagent_files'])} subagent); the rest predate the window"
+        )
+    )
+    print(
+        f"  tokens in {num(totals['input'])}   out {num(totals['output'])}   "
+        f"cache read {num(totals['cache_read'])}   cache write {num(totals['cache_creation'])}"
+    )
+    print(f"  total {num(totals['total'])}")
+    if data["lines_skipped"] or data["files_unreadable"]:
+        print(
+            _d(
+                f"  skipped {num(data['lines_skipped'])} unparseable line(s), "
+                f"{num(data['files_unreadable'])} unreadable file(s)"
+            )
+        )
+
+    heading("Frontier tokens per day")
+    table(
+        ["day", "sessions", "msgs", "input", "output", "cache read", "cache write", "total"],
+        [
+            [
+                day,
+                num(b.get("sessions", 0)),
+                num(b["messages"]),
+                num(b["input"]),
+                num(b["output"]),
+                num(b["cache_read"]),
+                num(b["cache_creation"]),
+                num(b["total"]),
+            ]
+            for day, b in data["by_day"].items()
+        ],
+        align_right=range(1, 8),
+    )
+
+    heading("Frontier tokens per project")
+    table(
+        ["project", "sessions", "msgs", "input", "output", "cache read", "total"],
+        [
+            [
+                project,
+                num(b.get("sessions", 0)),
+                num(b["messages"]),
+                num(b["input"]),
+                num(b["output"]),
+                num(b["cache_read"]),
+                num(b["total"]),
+            ]
+            for project, b in data["by_project"].items()
+        ],
+        align_right=range(1, 7),
+    )
+
+
+def print_proxies(data: dict[str, Any], weeks: dict[str, dict[str, Any]]) -> None:
+    heading("Per-task proxies")
+    sessions = data.get("sessions") or {}
+    if not data.get("available") or not sessions:
+        print("  not measurable yet")
+        print(
+            _d(
+                "  Needs frontier transcripts in the window; see the section above for why "
+                "there are none."
+            )
+        )
+        return
+
+    turns = [s["turns"] for s in sessions.values()]
+    tokens = [s["tokens"]["total"] for s in sessions.values()]
+    print(_d("  One session is treated as one task -- the closest proxy the transcripts"))
+    print(_d("  support. A session spanning two unrelated tasks inflates both numbers."))
+    print(
+        f"  turns to completion: median {int(statistics.median(turns))}   "
+        f"mean {statistics.mean(turns):.1f}   max {max(turns)}"
+    )
+    print(
+        f"  frontier tokens per task: median {num(int(statistics.median(tokens)))}   "
+        f"mean {num(int(statistics.mean(tokens)))}   max {num(max(tokens))}"
+    )
+
+    heading("Weekly trend (compare a baseline week to a later one)")
+    table(
+        ["week", "sessions", "turns", "med turns/task", "tokens", "med tokens/task"],
+        [
+            [
+                week,
+                num(b["sessions"]),
+                num(b["turns"]),
+                num(b["median_turns"]),
+                num(b["tokens"]),
+                num(b["median_tokens"]),
+            ]
+            for week, b in weeks.items()
+        ],
+        align_right=range(1, 6),
+    )
+
+    heading("Human corrections per task")
+    print("  not measurable yet")
+    print(
+        _d(
+            "  A correction is not distinguishable from a normal follow-up turn in the "
+            "transcript."
+        )
+    )
+    print(
+        _d(
+            "  Measurable once /fix-issue's retro step records a marker (a usage-journal row "
+            "with tool=retro and a corrected flag) when the human had to redirect it."
+        )
+    )
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="usage-report",
+        description="Where the tokens went: local offload calls and frontier spend.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Two independent sources, reported side by side:
+
+  offload    var/usage.jsonl, written by every h.chat()/h.embed() call the MCP
+             tools, hooks and bin/local make. Calls, tokens, latency, success
+             rate, and the fallback count -- the number that tells you the local
+             rung quietly stopped carrying the load.
+
+  frontier   best-effort read of ~/.claude/projects/**/*.jsonl. Read-only, and
+             skipped with a notice if the files are absent or the shape changed.
+
+Typical use:
+
+  bin/usage-report                      last 7 days
+  bin/usage-report --days 30 --by-tool  a month, broken out per tool and alias
+  bin/usage-report --since 2026-07-01   from a fixed date
+  bin/usage-report --json | jq .        the same numbers, structured
+
+Baseline one week before shipping a new offload path, then compare. A proxy
+that does not move turns-per-task is the kill rule's cue.
+""",
+    )
+    parser.add_argument(
+        "--days", type=int, default=7, metavar="N", help="window length in days (default: 7)"
+    )
+    parser.add_argument(
+        "--since", metavar="DATE", help="window start as YYYY-MM-DD or ISO timestamp; wins over --days"
+    )
+    parser.add_argument("--json", action="store_true", help="emit the same data as JSON on stdout")
+    parser.add_argument(
+        "--by-tool", action="store_true", help="add the per-tool x per-alias offload breakdown"
+    )
+    parser.add_argument(
+        "--frontier-only", action="store_true", help="skip the offload journal section"
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.days < 1:
+        raise h.HarnessError("--days must be at least 1")
+
+    now = datetime.now(timezone.utc)
+    since = parse_since(args.since) if args.since else now - timedelta(days=args.days)
+    if since > now:
+        raise h.HarnessError(f"--since {since.date()} is in the future")
+
+    offload = None
+    if not args.frontier_only:
+        offload = summarize_offload(h.read_usage(since=since))
+
+    frontier = scan_transcripts(since)
+    weeks = weekly_trend(frontier.get("sessions") or {})
+
+    if args.json:
+        payload = {
+            "window": {
+                "since": since.isoformat(),
+                "until": now.isoformat(),
+                "days": round((now - since).total_seconds() / 86400, 2),
+            },
+            "offload": offload,
+            "frontier": {
+                "available": frontier["available"],
+                "reason": frontier["reason"],
+                "root": frontier["root"],
+                "files_found": frontier["files_found"],
+                "files_scanned": frontier["files_scanned"],
+                "subagent_files": frontier["subagent_files"],
+                "files_unreadable": frontier["files_unreadable"],
+                "lines_skipped": frontier["lines_skipped"],
+                "by_day": frontier["by_day"],
+                "by_project": frontier["by_project"],
+                "sessions": frontier["sessions"],
+                "weekly_trend": weeks,
+            },
+            "not_measurable": {
+                "human_corrections_per_task": (
+                    "indistinguishable from a normal follow-up turn; needs a retro marker "
+                    "row (tool=retro) in the usage journal"
+                )
+            },
+        }
+        json.dump(payload, sys.stdout, indent=2, default=str)
+        print()
+        return 0
+
+    span = "" if args.since else f"  ({args.days} day window)"
+    print(_b(f"usage report  {since.date()} -> {now.date()}{span}"))
+    if offload is not None:
+        print_offload(offload, by_tool=args.by_tool)
+    frontier_only_note = args.frontier_only
+    print_frontier(frontier)
+    print_proxies(frontier, weeks)
+    if frontier_only_note:
+        print()
+        print(_d("  (--frontier-only: offload journal skipped)"))
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except h.HarnessError as exc:
+        h.die(str(exc))
+    except KeyboardInterrupt:
+        h.die("interrupted", code=130)
+    except BrokenPipeError:  # `| head` should not print a traceback
+        try:
+            sys.stdout.close()
+        finally:
+            raise SystemExit(0)

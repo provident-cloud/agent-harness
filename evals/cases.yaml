@@ -1,0 +1,73 @@
+# Replay cases for `bin/eval`. Empty on purpose.
+#
+# A case is not invented -- it is recorded. The first time an agent stumbles on
+# something real (a wrong assumption, an undocumented convention, a correction
+# you had to type twice), you fix it by adding a line to the repo's context file
+# and you record the stumble here. The stumble is the failing test, the context
+# diff is the fix, and replaying the case proves the fix still holds.
+#
+# Cases are therefore per-team and per-repo. Nothing generic belongs in this
+# file, which is why the template ships it empty. See evals/README.md.
+#
+# Uncomment and adapt. Every field `bin/eval` reads appears below.
+
+cases: []
+
+# cases:
+#   - id: api-migrations              # required, unique; used by --case and --filter
+#
+#     repo: acme-api                  # required. A bare name resolves to
+#                                     # <workspace_root>/<name> (where
+#                                     # bin/sync-workspace puts it). An absolute
+#                                     # path or ~/... path is used as-is.
+#     repo_path: /opt/checkouts/acme-api   # optional, overrides `repo` for lookup
+#                                          # when the checkout lives elsewhere
+#
+#     commit: "9f2c1ab"               # required. Any rev git can resolve, but a
+#                                     # full or short SHA is what keeps the case
+#                                     # reproducible. Must already be fetched;
+#                                     # a missing commit marks the case skipped.
+#                                     # Quote it -- YAML reads an all-digit SHA as
+#                                     # a number and drops its leading zeros.
+#
+#     task: |                         # required. Verbatim what you would type
+#       Add a nullable `archived_at` column to the accounts table
+#       and expose it on the accounts endpoint.
+#
+#     trap: >                         # required. One line: the real mistake this
+#       Writes the migration by hand instead of using `make migration`,
+#       so the down-migration is missing.
+#
+#     context_file: /path/to/acme-api/AGENTS.md   # optional. The file whose new
+#                                     # line is supposed to prevent the trap. The
+#                                     # judge reads it, and treats the agent
+#                                     # re-deriving anything stated here as a
+#                                     # failure. `context_files: [a, b]` also works.
+#
+#     expect_files:                   # optional. Files a correct run should have
+#       - db/migrations/README.md     # found or touched; the judge weighs these
+#       - Makefile                    # when answering "right files found?".
+#
+#     verify: make test-migrations    # optional shell command, run with bash in
+#                                     # the worktree after the agent finishes. Its
+#                                     # exit code and output feed the judge's
+#                                     # "tests passed without correction?" answer.
+#
+#     agent_command: >                # optional. Default:
+#       claude --print --permission-mode acceptEdits -- {task}
+#                                     # Split with shlex, then each token gets
+#                                     # {task} {id} {repo} {commit} {trap}
+#                                     # {worktree} substituted. Runs with the
+#                                     # worktree as its cwd. Use any agent CLI
+#                                     # that prints its transcript to stdout.
+#
+#     timeout: 900                    # optional seconds for the agent command and
+#                                     # for `verify` (default 900)
+#
+#     enabled: false                  # optional. false marks the case skipped
+#                                     # without deleting it -- useful while the
+#                                     # underlying repo is mid-refactor.
+#
+#     notes: >                        # optional, ignored by bin/eval. Where the
+#       Found in PR #412 review.      # stumble came from, so the next person
+#                                     # knows whether it is still worth replaying.

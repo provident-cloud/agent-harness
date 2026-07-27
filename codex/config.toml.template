@@ -1,0 +1,42 @@
+# Codex CLI pointed at the harness LiteLLM proxy, so Codex and Claude Code share
+# one alias contract and one usage journal.
+#
+#   mkdir -p ~/.codex
+#   cp codex/config.toml.template ~/.codex/config.toml
+#
+# If you already have a ~/.codex/config.toml, merge the [model_providers.harness]
+# and [profiles.*] blocks into it instead of overwriting the file.
+#
+# Requires the proxy to be running: ./setup.sh --start
+#
+# Model names here are ALWAYS the harness aliases -- local-big, local-fast,
+# local-embed -- never a concrete model. The alias -> model mapping lives in
+# litellm/profiles/<tier>.yaml, which is what makes moving to a bigger machine a
+# no-op for every config that references it.
+
+model = "local-fast"
+model_provider = "harness"
+
+[model_providers.harness]
+name = "Agent harness (LiteLLM)"
+base_url = "http://127.0.0.1:4000/v1"
+# Codex reads the key from this environment variable; .envrc sets it, and the
+# harness default is sk-harness-local.
+env_key = "LITELLM_MASTER_KEY"
+wire_api = "chat"
+
+# Local models are slower than a hosted frontier endpoint, and on the 32GB tier
+# local-big is a hosted call over the network. Give both room before timing out.
+request_max_retries = 2
+stream_max_retries = 3
+stream_idle_timeout_ms = 300000
+
+# `codex --profile big` for compression and review passes; the default profile
+# above stays on local-fast for drafts and short edits.
+[profiles.big]
+model = "local-big"
+model_provider = "harness"
+
+[profiles.fast]
+model = "local-fast"
+model_provider = "harness"

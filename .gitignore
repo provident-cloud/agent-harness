@@ -1,0 +1,23 @@
+# Generated, team-specific content: repo lists, workspace context, model pins.
+# It stays out of this public template by default. A private fork that tracks this
+# repo as upstream may well want it committed -- that is the intended way to share a
+# harness with a team. To do that, add `!config/` below this line (or delete the rule).
+config/
+
+# Runtime state: logs, PID file, the usage journal.
+var/
+
+# Local secrets. Copy .envrc.template to .envrc; never commit the result.
+.envrc
+
+.venv
+__pycache__/
+*.pyc
+.DS_Store
+litellm.log
+*.db
+
+# Tool caches produced by linting the harness itself.
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/

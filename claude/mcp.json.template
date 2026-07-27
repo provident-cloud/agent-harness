@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "offload": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--quiet",
+        "--script",
+        "__HARNESS_ROOT__/mcp/offload-server/server.py"
+      ],
+      "env": {
+        "HARNESS_ROOT": "__HARNESS_ROOT__"
+      }
+    }
+  }
+}

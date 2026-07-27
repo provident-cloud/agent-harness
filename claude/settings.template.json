@@ -1,0 +1,18 @@
+{
+  "env": {
+    "HARNESS_ROOT": "__HARNESS_ROOT__"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HARNESS_ROOT__/claude/hooks/post-edit-lint.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

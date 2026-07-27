@@ -1,0 +1,1023 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""Talk to the local model ladder from a shell, outside any agent session."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import harness_lib as h  # noqa: E402
+
+import argparse  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+import platform  # noqa: E402
+import re  # noqa: E402
+import subprocess  # noqa: E402
+import textwrap  # noqa: E402
+import time  # noqa: E402
+import urllib.request  # noqa: E402
+
+# A 7B sprinter has a small context window and every tier's local-big is metered
+# one way or another. Truncating loudly beats a 500 from the proxy ten seconds in.
+DRAFT_MAX_CHARS = 24_000
+REDUCE_MAX_CHARS = 20_000
+COMMIT_WIDTH = 72
+
+
+# --------------------------------------------------------------------------
+# Alias plumbing -- the one rule this CLI enforces on its callers
+# --------------------------------------------------------------------------
+
+
+def chat_aliases(cfg: h.Config) -> list[str]:
+    """Chat-capable aliases for the active tier, contract order first.
+
+    Read from the tier table rather than hardcoded so a tier that publishes an
+    extra rung (the 32GB degraded local-big, say) accepts it without a code change.
+    """
+    table = cfg.models
+    ordered = [a for a in (*h.ALIASES, h.REMOTE_ALIAS) if a in table and a != "local-embed"]
+    extra = sorted(k for k in table if k not in ordered and k not in ("keep_alive", "local-embed"))
+    return ordered + extra
+
+
+def validate_alias(value: str | None, cfg: h.Config, default: str) -> str:
+    """Accept a harness alias, reject a concrete model name with the reason why."""
+    alias = value or default
+    allowed = chat_aliases(cfg)
+    if alias in allowed:
+        return alias
+    hint = ""
+    if alias == "local-embed":
+        hint = "\n  local-embed is an embedding alias -- it cannot answer a chat request."
+    raise h.HarnessError(
+        f"--model takes a harness alias, not a model name (got {alias!r})."
+        f"{hint}\n"
+        f"  aliases on the {cfg.tier} tier: {', '.join(allowed)}\n"
+        "\n"
+        "  Concrete model names live in exactly two places -- the LiteLLM profile for\n"
+        "  your tier and config/tier-overrides.yaml -- and nowhere else. Naming an\n"
+        "  alias here is what makes the 32GB -> 128GB machine upgrade a no-op: the\n"
+        "  same alias resolves to a bigger model and no caller changes.\n"
+        "  Run `bin/local models` to see what each alias resolves to right now."
+    )
+
+
+def require_proxy(cfg: h.Config) -> None:
+    """Fail before doing any work if the proxy cannot answer."""
+    if h.litellm_up(cfg):
+        return
+    raise h.HarnessError(
+        f"the LiteLLM proxy is not answering at {cfg.base_url}.\n"
+        "  fix: ./setup.sh --start\n"
+        "  then `bin/local health` for the full picture."
+    )
+
+
+def proxy_model_names(cfg: h.Config, timeout: float = 4.0) -> list[str] | None:
+    """Model names the proxy currently serves, or None when it cannot be asked."""
+    key = os.environ.get("LITELLM_MASTER_KEY") or h.DEFAULT_MASTER_KEY
+    req = urllib.request.Request(
+        f"{cfg.base_url}/models", headers={"Authorization": f"Bearer {key}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    return sorted({str(m.get("id")) for m in (data.get("data") or []) if m.get("id")})
+
+
+def ollama_status(timeout: float = 2.0) -> tuple[bool, int]:
+    """(reachable, model count) for the local ollama daemon."""
+    try:
+        with urllib.request.urlopen(f"{h.OLLAMA_BASE}/api/tags", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        return True, len(data.get("models") or [])
+    except Exception:
+        return False, 0
+
+
+def is_hosted(model: str) -> bool:
+    """True when the alias resolves off-machine (anything not served by ollama)."""
+    return not str(model).startswith("ollama/")
+
+
+# --------------------------------------------------------------------------
+# Text helpers
+# --------------------------------------------------------------------------
+
+_FENCE = re.compile(r"\A\s*```[^\n]*\n(?P<body>.*?)\n?```\s*\Z", re.DOTALL)
+
+
+def strip_fences(text: str) -> str:
+    """Drop a code fence that wraps the whole answer; leave inner fences alone."""
+    m = _FENCE.match(text)
+    return m.group("body") if m else text.strip()
+
+
+def wrap_commit(message: str) -> str:
+    """Rewrap a commit body at 72 columns.
+
+    The prompt asks for it, but small models drift. Doing it here makes the
+    promise true without touching the subject line, indented blocks (pasted
+    output, code) or short lines.
+    """
+    lines = message.strip().splitlines()
+    if not lines:
+        return message.strip()
+    out = [lines[0].rstrip()]
+    for raw in lines[1:]:
+        line = raw.rstrip()
+        if not line.strip() or line.startswith(("    ", "\t")) or len(line) <= COMMIT_WIDTH:
+            out.append(line)
+            continue
+        bullet = re.match(r"^(\s*(?:[-*+]|\d+[.)])\s+)", line)
+        indent = " " * len(bullet.group(1)) if bullet else ""
+        out.extend(
+            textwrap.wrap(
+                line,
+                width=COMMIT_WIDTH,
+                subsequent_indent=indent,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+        )
+    return "\n".join(out).strip()
+
+
+def truncate(text: str, limit: int, label: str) -> str:
+    if len(text) <= limit:
+        return text
+    h.warn(f"{label} is {len(text):,} chars; using the first {limit:,} to stay inside context")
+    return text[:limit] + f"\n\n[truncated: {len(text) - limit:,} more characters]"
+
+
+def collect_input(file: str | None, *, allow_stdin: bool = True) -> str:
+    """File argument, else piped stdin, else nothing (empty string)."""
+    if file:
+        return h.read_input(file)
+    if allow_stdin and not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
+# --------------------------------------------------------------------------
+# summarize
+# --------------------------------------------------------------------------
+
+SUMMARIZE_SYSTEM = """\
+You compress engineering material -- logs, diffs, transcripts, docs, test output --
+for a reader who will act on it.
+
+Copy these VERBATIM. Never paraphrase, reword, shorten, prettify or "correct" them:
+  - error and exception messages, exactly as written
+  - file paths and line numbers
+  - failing test names and other identifiers
+  - commands, flags, exit codes
+  - version numbers, commit hashes, URLs
+
+A paraphrased stack trace is worse than no summary at all: the reader cannot grep for
+it, cannot search it, and cannot trust anything else you wrote. When in doubt about a
+detail, quote it.
+
+Keep the causal thread: what happened, what broke, what was decided, what is still
+open. Drop pleasantries, repetition and boilerplate.
+
+Write plain prose with short bullet lists where they help. No preamble, no "Here is a
+summary", no closing commentary. Output the summary only."""
+
+
+def summarize_instructions(focus: str | None, max_words: int | None) -> str:
+    parts = []
+    if focus:
+        parts.append(
+            f"Focus on: {focus}\n"
+            "Drop anything unrelated, but never drop a verbatim detail that belongs to "
+            "something you kept."
+        )
+    if max_words:
+        parts.append(f"Hard limit: at most {max_words} words.")
+    return ("\n\n".join(parts) + "\n\n") if parts else ""
+
+
+def cmd_summarize(args: argparse.Namespace) -> int:
+    cfg = h.load_config(required=False)
+    model = validate_alias(args.model, cfg, "local-big")
+    text = h.read_input(args.file)
+    if not text.strip():
+        raise h.HarnessError("input is empty -- nothing to summarize")
+
+    require_proxy(cfg)
+    chunks = list(h.chunk_text(text))
+    tail = summarize_instructions(args.focus, args.max_words)
+    budget = max(512, (args.max_words * 2 + 256) if args.max_words else 1500)
+
+    if len(chunks) == 1:
+        h.step(f"summarizing {len(text):,} chars with {model}")
+        out = h.chat(
+            f"{tail}Summarize the material below.\n\n---\n{chunks[0]}\n---",
+            model=model,
+            system=SUMMARIZE_SYSTEM,
+            max_tokens=budget,
+            tool="local:summarize",
+            cfg=cfg,
+        )
+        print(strip_fences(out))
+        return 0
+
+    h.step(f"summarizing {len(text):,} chars in {len(chunks)} chunks with {model}")
+    partials: list[str] = []
+    started = time.time()
+    for i, chunk in enumerate(chunks, 1):
+        h.info(h.dim(f"  chunk {i}/{len(chunks)}"))
+        partials.append(
+            h.chat(
+                f"This is part {i} of {len(chunks)} of a longer document. Summarize THIS "
+                "part only; do not speculate about the rest.\n\n"
+                f"---\n{chunk}\n---",
+                model=model,
+                system=SUMMARIZE_SYSTEM,
+                max_tokens=1200,
+                tool="local:summarize",
+                cfg=cfg,
+            ).strip()
+        )
+
+    # Reduce, repeatedly if the partials are themselves too long to merge in one pass.
+    round_no = 0
+    while True:
+        joined = "\n\n".join(f"[part {i}]\n{p}" for i, p in enumerate(partials, 1))
+        if len(partials) == 1 or len(joined) <= REDUCE_MAX_CHARS:
+            break
+        round_no += 1
+        h.info(h.dim(f"  reduce pass {round_no} ({len(partials)} parts)"))
+        merged: list[str] = []
+        for group in h.chunk_text(joined, size=REDUCE_MAX_CHARS, overlap=0):
+            merged.append(
+                h.chat(
+                    "Merge these partial summaries into one, losing no verbatim detail.\n\n"
+                    f"---\n{group}\n---",
+                    model=model,
+                    system=SUMMARIZE_SYSTEM,
+                    max_tokens=1500,
+                    tool="local:summarize",
+                    cfg=cfg,
+                ).strip()
+            )
+        partials = merged
+
+    h.info(h.dim("  merging"))
+    out = h.chat(
+        f"{tail}These are ordered partial summaries of one document. Merge them into a "
+        "single coherent summary. Remove duplication between parts. Keep every verbatim "
+        "error message, path, line number and test name that appears in them.\n\n"
+        f"---\n{joined}\n---",
+        model=model,
+        system=SUMMARIZE_SYSTEM,
+        max_tokens=budget,
+        tool="local:summarize",
+        cfg=cfg,
+    )
+    h.ok(f"done in {time.time() - started:.1f}s")
+    print(strip_fences(out))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# draft
+# --------------------------------------------------------------------------
+
+DRAFT_SYSTEMS = {
+    "commit": """\
+You write git commit messages. Output the message and nothing else.
+
+Format:
+  - Subject line: at most 72 characters, imperative mood ("Add", never "Added" or
+    "Adds"), capitalised, no trailing period.
+  - Then a blank line, then a body wrapped at 72 columns.
+  - Omit the body entirely when the subject already says everything.
+
+The body explains WHY the change was made and anything non-obvious about HOW. It does
+not list the files touched -- the diff already does that.
+
+No filler. Never write "This commit", "Various changes", "Updated code", or a bullet
+list that restates the file names. Do not invent a ticket number, a co-author or a
+motivation the diff does not support. No markdown, no code fences, no preamble.""",
+    "pr": """\
+You write pull request descriptions. Output markdown and nothing else.
+
+Structure:
+  - One short paragraph: what changes and why. No title heading.
+  - `## Changes` -- a few bullets of substantive change. Not a file listing.
+  - `## Testing` -- exactly how this was verified. If the input does not say, write
+    "Not stated." Never invent a test run.
+  - `## Risk` -- only if there is a real one (migration, behaviour change, rollback
+    concern). Omit the section otherwise.
+
+Concrete and short. No preamble, no "This PR", no emoji, no wrapping code fence.""",
+    "changelog": """\
+You write changelog entries in Keep a Changelog style. Output the entries and nothing
+else.
+
+Group under `### Added`, `### Changed`, `### Fixed`, `### Removed`. Omit empty groups.
+One line per entry, present tense, written from the user's point of view -- what they
+can now do or no longer hit, not which function was refactored. Skip internal changes
+a user cannot observe. Keep verbatim any flag, command or config key that a user types.
+
+No preamble, no version header unless the input gives one, no wrapping code fence.""",
+    "test": """\
+You write tests for the code you are shown. Output test code and nothing else.
+
+Match what the input already uses: language, test framework, assertion style, naming
+convention, fixture and import layout. Never introduce a framework that is not already
+in evidence.
+
+Cover the boundaries and the failure modes -- empty input, None, wrong type, limits,
+error paths -- not just the happy path. Each test asserts one thing and its name says
+what. No explanatory prose, no comments restating the code, no placeholder TODO.""",
+}
+
+DRAFT_PROMPTS = {
+    "commit": "Write the commit message for this staged diff.",
+    "pr": "Write the pull request description for these changes.",
+    "changelog": "Write the changelog entries for these changes.",
+    "test": "Write tests for this code.",
+}
+
+
+def staged_diff() -> str:
+    """`git diff --staged` in the cwd -- the common case for `draft commit`."""
+    try:
+        # Ask first: outside a work tree `git diff --staged` silently switches to
+        # --no-index mode and prints a usage dump about an "unknown option".
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True
+        )
+    except FileNotFoundError as exc:  # pragma: no cover - git is a hard dependency
+        raise h.HarnessError("git is not on PATH; pass a diff file or pipe one on stdin") from exc
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        raise h.HarnessError(
+            f"{Path.cwd()} is not inside a git work tree, so there is no staged diff.\n"
+            "  fix: cd into the repository, or pass a diff:\n"
+            "       bin/local draft commit some.diff   |   git diff | bin/local draft commit -"
+        )
+    proc = subprocess.run(
+        ["git", "diff", "--staged", "--no-color"], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip().splitlines()[0] if proc.stderr.strip() else "unknown error"
+        raise h.HarnessError(
+            f"`git diff --staged` failed here: {detail}\n"
+            "  fix: run this from inside a git repository, or pass a file / pipe a diff."
+        )
+    if not proc.stdout.strip():
+        raise h.HarnessError(
+            "nothing is staged, so there is no diff to describe.\n"
+            "  fix: `git add -p` what belongs in the commit, or pipe one:\n"
+            "       git diff | bin/local draft commit -"
+        )
+    return proc.stdout
+
+
+def cmd_draft(args: argparse.Namespace) -> int:
+    cfg = h.load_config(required=False)
+    model = validate_alias(args.model, cfg, "local-fast")
+
+    body = collect_input(args.file).strip()
+    source = "input"
+    if not body and args.kind == "commit":
+        body = staged_diff()
+        source = "staged diff"
+    if not body:
+        raise h.HarnessError(
+            f"no input for `draft {args.kind}` -- pass a file path, or pipe text on stdin"
+        )
+    body = truncate(body, DRAFT_MAX_CHARS, source)
+
+    require_proxy(cfg)
+    prompt = DRAFT_PROMPTS[args.kind]
+    if args.context:
+        prompt += f"\n\nAdditional context from the author (trust it over the diff):\n{args.context}"
+    h.step(f"drafting {args.kind} from {source} ({len(body):,} chars) with {model}")
+
+    out = h.chat(
+        f"{prompt}\n\n---\n{body}\n---",
+        model=model,
+        system=DRAFT_SYSTEMS[args.kind],
+        max_tokens=1600,
+        tool=f"local:draft:{args.kind}",
+        cfg=cfg,
+    )
+    out = strip_fences(out)
+    if args.kind == "commit":
+        out = wrap_commit(out)
+    print(out)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# ask
+# --------------------------------------------------------------------------
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    cfg = h.load_config(required=False)
+    model = validate_alias(args.model, cfg, "local-fast")
+    prompt = " ".join(args.prompt).strip()
+
+    if prompt == "-":
+        prompt = h.read_input("-").strip()
+    elif not sys.stdin.isatty():
+        # `cat file | local ask "what breaks here?"` -- the pipe is the material.
+        piped = sys.stdin.read()
+        if piped.strip():
+            prompt = f"{prompt}\n\n---\n{truncate(piped, DRAFT_MAX_CHARS, 'stdin')}\n---"
+    if not prompt:
+        raise h.HarnessError("empty prompt")
+
+    require_proxy(cfg)
+    h.step(f"asking {model}")
+    out = h.chat(
+        prompt,
+        model=model,
+        system=args.system,
+        max_tokens=args.max_tokens,
+        tool="local:ask",
+        cfg=cfg,
+    )
+    print(out.strip())
+    return 0
+
+
+# --------------------------------------------------------------------------
+# search / index -- lib/workspace_index.py, imported lazily on purpose
+# --------------------------------------------------------------------------
+
+
+def workspace_index():
+    """Import the index module only when a subcommand actually needs it.
+
+    Everything else in this CLI -- including `--help` -- must keep working when
+    lib/workspace_index.py is absent or its own dependencies are not installed.
+    """
+    try:
+        import workspace_index as wi  # type: ignore[import-not-found]
+    except ModuleNotFoundError as exc:
+        missing = exc.name or "workspace_index"
+        if missing == "workspace_index":
+            raise h.HarnessError(
+                "lib/workspace_index.py is missing, so `search` and `index` cannot run.\n"
+                "  Every other bin/local subcommand works without it.\n"
+                "  fix: update your harness checkout (`git pull`) to get the file."
+            ) from exc
+        raise h.HarnessError(
+            f"lib/workspace_index.py needs the {missing!r} package, which is not installed.\n"
+            f"  fix: uv pip install {missing}  (or add it to the script header of bin/local)"
+        ) from exc
+    return wi
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    wi = workspace_index()
+    cfg = h.load_config()
+    hits = wi.search(
+        args.query, workspace_root=cfg.workspace_root, limit=args.limit, repo=args.repo
+    )
+
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "path": str(hit.path),
+                        "repo": hit.repo,
+                        "start_line": hit.start_line,
+                        "end_line": hit.end_line,
+                        "score": hit.score,
+                        "snippet": hit.snippet,
+                    }
+                    for hit in hits
+                ],
+                indent=2,
+            )
+        )
+        return 0
+
+    if not hits:
+        h.warn(f"no matches for {args.query!r}")
+        try:
+            status = wi.index_status(cfg.workspace_root) or {}
+        except Exception:
+            status = {}
+        if not status or not (status.get("files") or status.get("chunks")):
+            h.info("  there is no index yet -- build one with `bin/local index`")
+        elif args.repo:
+            h.info(f"  --repo {args.repo} narrowed the search; try without it")
+        return 0
+
+    for hit in hits:
+        location = f"{hit.path}:{hit.start_line}-{hit.end_line}"
+        print(f"{hit.score:.2f}  {hit.repo}  {location}")
+        for line in str(hit.snippet or "").splitlines()[:12]:
+            print(f"      {line}")
+        print()
+    sys.stdout.flush()  # keep the stderr summary after the piped hits, not before
+    h.ok(f"{len(hits)} hit{'s' if len(hits) != 1 else ''}")
+    return 0
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    wi = workspace_index()
+    cfg = h.load_config()
+    h.step(f"indexing {cfg.workspace_root}" + (f" (repo: {args.repo})" if args.repo else ""))
+    if args.force:
+        h.info(h.dim("  --force: rebuilding from scratch"))
+
+    stats = wi.build_index(
+        cfg.workspace_root,
+        repos=[args.repo] if args.repo else None,
+        force=args.force,
+        progress=lambda msg: h.info(h.dim(f"  {msg}")),
+    )
+    h.ok(
+        f"{stats.files} files, {stats.chunks} chunks, {stats.skipped} skipped "
+        f"in {stats.duration_s:.1f}s"
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "files": stats.files,
+                    "chunks": stats.chunks,
+                    "skipped": stats.skipped,
+                    "duration_s": stats.duration_s,
+                },
+                indent=2,
+            )
+        )
+    return 0
+
+
+# --------------------------------------------------------------------------
+# models
+# --------------------------------------------------------------------------
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    cfg = h.load_config(required=False)
+    table = cfg.models
+    served = proxy_model_names(cfg)
+    origin = "pinned in config/harness.yaml" if cfg.tier_is_pinned else "auto-detected"
+
+    rows = []
+    for alias in [a for a in (*h.ALIASES, h.REMOTE_ALIAS) if a in table] + sorted(
+        k for k in table if k not in (*h.ALIASES, h.REMOTE_ALIAS, "keep_alive")
+    ):
+        rows.append(
+            {
+                "alias": alias,
+                "model": table[alias],
+                "hosted": is_hosted(table[alias]),
+                "served": None if served is None else alias in served,
+            }
+        )
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "tier": cfg.tier,
+                    "tier_source": origin,
+                    "keep_alive": table.get("keep_alive"),
+                    "proxy": {"base_url": cfg.base_url, "up": served is not None},
+                    "aliases": rows,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"tier        {cfg.tier}  ({origin})")
+    print(f"keep_alive  {table.get('keep_alive', '-')}")
+    print(f"proxy       {cfg.base_url}  " + ("up" if served is not None else "DOWN"))
+    print()
+    width = max(len(r["alias"]) for r in rows)
+    print(f"{'alias'.ljust(width)}  {'resolves to'.ljust(34)}  served")
+    for row in rows:
+        if row["served"] is None:
+            state = "? (proxy down)"
+        else:
+            state = "yes" if row["served"] else "NO"
+        where = "hosted" if row["hosted"] else "local"
+        print(f"{row['alias'].ljust(width)}  {str(row['model']).ljust(34)}  {state}  ({where})")
+
+    sys.stdout.flush()  # keep the stderr notes after the piped table, not before
+    if served is None:
+        h.warn("could not ask the proxy which models it serves")
+        h.info("  fix: ./setup.sh --start")
+    else:
+        missing = [r["alias"] for r in rows if r["served"] is False]
+        if missing:
+            h.warn(f"the proxy does not serve: {', '.join(missing)}")
+            h.info(f"  the running proxy predates {cfg.profile_path.name} or was started")
+            h.info("  with a different profile -- fix: ./setup.sh --restart")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# health
+# --------------------------------------------------------------------------
+
+KEYS = (
+    ("LITELLM_MASTER_KEY", "optional -- the proxy falls back to its default local key"),
+    ("OSS_API_BASE", "hosted OpenAI-compatible endpoint for the hosted rungs"),
+    ("OSS_API_KEY", "key for OSS_API_BASE"),
+    ("ANTHROPIC_API_KEY", "only needed if you enable the frontier escape hatch"),
+)
+
+PROBE_PROMPT = "Reply with exactly one word: ok"
+
+
+def probe_chat(alias: str, cfg: h.Config) -> dict:
+    started = time.time()
+    try:
+        text = h.chat(
+            PROBE_PROMPT,
+            model=alias,
+            max_tokens=16,
+            temperature=0.0,
+            timeout=180.0,
+            tool="local:health",
+            cfg=cfg,
+        )
+        return {
+            "alias": alias,
+            "ok": True,
+            "seconds": round(time.time() - started, 2),
+            "reply": " ".join(text.split())[:60],
+        }
+    except h.HarnessError as exc:
+        return {
+            "alias": alias,
+            "ok": False,
+            "seconds": round(time.time() - started, 2),
+            "error": " ".join(str(exc).split())[:300],
+        }
+
+
+def probe_embed(cfg: h.Config) -> dict:
+    started = time.time()
+    try:
+        vectors = h.embed(["ok"], tool="local:health", cfg=cfg)
+        dims = len(vectors[0]) if vectors and vectors[0] else 0
+        return {
+            "alias": "local-embed",
+            "ok": bool(dims),
+            "seconds": round(time.time() - started, 2),
+            "reply": f"{dims}-dim vector",
+        }
+    except h.HarnessError as exc:
+        return {
+            "alias": "local-embed",
+            "ok": False,
+            "seconds": round(time.time() - started, 2),
+            "error": " ".join(str(exc).split())[:300],
+        }
+
+
+def annotate_fallbacks(probes: list[dict], since: datetime) -> None:
+    """Mark probes that LiteLLM quietly served with a different model.
+
+    ``h.chat()`` returns only text, but it journals the model LiteLLM actually
+    answered with. A hosted alias silently degrading to a small local model is
+    exactly the failure this command exists to catch, so read it back.
+    """
+    try:
+        rows = [r for r in h.read_usage(since) if r.get("tool") == "local:health"]
+    except Exception:
+        return
+    latest = {str(r.get("alias")): r for r in rows}
+    for probe in probes:
+        row = latest.get(probe["alias"])
+        if not row:
+            continue
+        probe["resolved"] = row.get("model_resolved")
+        probe["fallback"] = bool(row.get("fallback"))
+
+
+def probe_fix(alias: str, model: str, cfg: h.Config, ollama_ok: bool) -> str:
+    """The single most likely fix for a failed probe on this alias."""
+    if is_hosted(model):
+        if not os.environ.get("OSS_API_KEY") or not os.environ.get("OSS_API_BASE"):
+            return (
+                f"{alias} resolves to a hosted model; set OSS_API_BASE and OSS_API_KEY "
+                "(copy .envrc.template to .envrc) and restart the proxy"
+            )
+        return (
+            f"the hosted endpoint rejected the call -- check OSS_API_BASE serves "
+            f"{model.split('/', 1)[-1]!r} and that OSS_API_KEY is valid"
+        )
+    if not ollama_ok:
+        return "ollama is not running -- fix: `ollama serve` (or `brew services start ollama`)"
+    tag = model.split("/", 1)[-1]
+    return f"the model is not pulled locally -- fix: `ollama pull {tag}`"
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    cfg = h.load_config(required=False)
+    table = cfg.models
+    ram = h.detect_ram_gb()
+    config_file = h.config_dir() / "harness.yaml"
+    proxy_up = h.litellm_up(cfg)
+    served = proxy_model_names(cfg) if proxy_up else None
+    ollama_ok, ollama_models = ollama_status()
+    problems: list[str] = []
+
+    report: dict = {
+        "host": {
+            "platform": f"{platform.system()} {platform.release()} ({platform.machine()})",
+            "ram_gb": ram,
+        },
+        "tier": cfg.tier,
+        "tier_pinned": cfg.tier_is_pinned,
+        "config": {"path": str(config_file), "present": config_file.exists()},
+        "workspace_root": str(cfg.workspace_root),
+        "services": {
+            "litellm": {"base_url": cfg.base_url, "up": proxy_up, "models": served},
+            "ollama": {"base_url": h.OLLAMA_BASE, "up": ollama_ok, "models": ollama_models},
+        },
+        "keys": {name: bool(os.environ.get(name)) for name, _ in KEYS},
+        "aliases": {a: table[a] for a in table if a != "keep_alive"},
+        "probes": [],
+    }
+
+    if not args.json:
+        h.step("host")
+        h.info(f"  platform    {report['host']['platform']}")
+        h.info(f"  memory      {ram} GB")
+        h.info(f"  tier        {cfg.tier} " + ("(pinned)" if cfg.tier_is_pinned else "(auto)"))
+        h.info(f"  profile     {cfg.profile_path}")
+        if config_file.exists():
+            h.info(f"  config      {config_file}")
+            h.info(f"  workspace   {cfg.workspace_root}")
+        else:
+            h.warn(f"no {config_file}")
+            h.info("  fix: run `bin/init` (or /harness-init inside Claude Code)")
+            h.info("  chat still works on tier defaults; search and index need the config")
+
+        h.step("services")
+        if proxy_up:
+            h.ok(f"litellm   {cfg.base_url}  ({len(served or [])} models served)")
+        else:
+            h.error(f"litellm   {cfg.base_url}  not answering")
+            h.info("  fix: ./setup.sh --start")
+        if ollama_ok:
+            h.ok(f"ollama    {h.OLLAMA_BASE}  ({ollama_models} models pulled)")
+        else:
+            h.error(f"ollama    {h.OLLAMA_BASE}  not answering")
+            h.info("  fix: `ollama serve`, or `brew services start ollama` to keep it up")
+
+    if not proxy_up:
+        problems.append("litellm proxy is down")
+    if not config_file.exists():
+        problems.append("harness is not initialised (no config/harness.yaml)")
+    if not ollama_ok and any(not is_hosted(v) for k, v in table.items() if k != "keep_alive"):
+        problems.append("ollama is down and this tier needs it")
+
+    # Credentials. Names and set/unset only -- never a value, not even a prefix.
+    if not args.json:
+        h.step("credentials (values are never printed)")
+        for name, why in KEYS:
+            if os.environ.get(name):
+                h.ok(f"{name.ljust(20)} set")
+            else:
+                h.info(f"  {name.ljust(20)} unset   {h.dim(why)}")
+
+    # These are this shell's variables. The proxy reads its own environment when it
+    # starts, so unset here does not mean broken -- the live probes below settle it.
+    needs_oss = [a for a, m in table.items() if a != "keep_alive" and is_hosted(m)]
+    oss_ready = bool(os.environ.get("OSS_API_BASE") and os.environ.get("OSS_API_KEY"))
+    if needs_oss and not oss_ready and not args.json:
+        h.warn(f"{', '.join(needs_oss)} resolve to hosted models and OSS_* is unset here")
+        if proxy_up:
+            h.info("  the proxy may still have them from the shell that started it -- the live")
+            h.info("  completions below are the real test. If a hosted alias fails:")
+        else:
+            h.info("  the proxy holds its own copy, so this cannot be settled until it is up:")
+        h.info("  fix: cp .envrc.template .envrc, fill in OSS_API_BASE and OSS_API_KEY,")
+        h.info("       `direnv allow`, then ./setup.sh --restart")
+        h.info("  or:  pin those aliases at a local tag in config/tier-overrides.yaml")
+
+    if not args.json:
+        h.step("aliases")
+        for alias in [a for a in (*h.ALIASES, h.REMOTE_ALIAS) if a in table] + sorted(
+            k for k in table if k not in (*h.ALIASES, h.REMOTE_ALIAS, "keep_alive")
+        ):
+            model = table[alias]
+            mark = "hosted" if is_hosted(model) else "local"
+            note = ""
+            if served is not None and alias not in served:
+                note = "  <- not served by the running proxy"
+            h.info(f"  {alias.ljust(20)} {str(model).ljust(34)} ({mark}){note}")
+        h.info(f"  {'keep_alive'.ljust(20)} {table.get('keep_alive', '-')}")
+
+    # Live completions -- the only part that proves the whole path works.
+    if not args.json:
+        h.step("live completions")
+    if not proxy_up:
+        report["probes_skipped"] = "litellm proxy is down"
+        if not args.json:
+            h.warn("skipped -- the proxy is down, so there is nothing to call")
+            h.info("  fix: ./setup.sh --start, then re-run `bin/local health`")
+    else:
+        since = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=1)
+        probes = [probe_chat(a, cfg) for a in ("local-big", "local-fast") if a in table]
+        if "local-embed" in table:
+            probes.append(probe_embed(cfg))
+        annotate_fallbacks(probes, since)
+        report["probes"] = probes
+        for probe in probes:
+            alias = probe["alias"]
+            if probe["ok"]:
+                if probe.get("fallback"):
+                    problems.append(
+                        f"{alias} answered via a fallback ({probe.get('resolved')})"
+                    )
+                if not args.json:
+                    h.ok(f"{alias.ljust(20)} {probe['seconds']:>6.2f}s  {probe.get('reply', '')}")
+                    if probe.get("fallback"):
+                        h.warn(
+                            f"  {alias} was served by {probe.get('resolved')} -- a fallback, "
+                            "not the model the alias promises"
+                        )
+                        h.info("  fix: " + probe_fix(alias, table[alias], cfg, ollama_ok))
+            else:
+                problems.append(f"{alias} probe failed")
+                if not args.json:
+                    h.error(f"{alias.ljust(20)} {probe['seconds']:>6.2f}s  {probe['error']}")
+                    h.info("  fix: " + probe_fix(alias, table[alias], cfg, ollama_ok))
+
+    report["problems"] = problems
+    report["healthy"] = not problems
+    if args.json:
+        print(json.dumps(report, indent=2))
+    elif problems:
+        h.step("summary")
+        for problem in problems:
+            h.error(problem)
+    else:
+        h.step("summary")
+        h.ok("harness is healthy")
+    return 1 if problems else 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+EPILOG = """\
+examples:
+  git add -p && bin/local draft commit
+  bin/local summarize build.log --focus "why the deploy failed"
+  pytest -q | bin/local summarize - --max-words 150
+  bin/local ask "what does GIT_DIR do" --model local-fast
+  bin/local search "retry with backoff" --limit 5
+  bin/local health
+
+Every model argument is an alias (local-big, local-fast, local-embed). Concrete
+models are pinned per hardware tier in the LiteLLM profile, so the same command
+works unchanged on a 32GB laptop and a 128GB workstation.
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="local",
+        description="Run the local model ladder from a shell, outside any agent session.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    def add(name: str, help_text: str, description: str) -> argparse.ArgumentParser:
+        return sub.add_parser(
+            name,
+            help=help_text,
+            description=description,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+
+    p = add(
+        "summarize",
+        "compress a file, a log or piped text",
+        "Compress a file, a log or piped text with local-big.\n\n"
+        "Long inputs are chunked and summarized map-reduce style. Error messages,\n"
+        "file paths, line numbers and failing test names are preserved verbatim --\n"
+        "a summary you cannot grep is not worth having.",
+    )
+    p.add_argument("file", nargs="?", help="file to read; '-' or omitted reads stdin")
+    p.add_argument("--focus", help="what the summary should centre on")
+    p.add_argument("--max-words", type=int, help="hard word budget for the final summary")
+    p.add_argument("--model", help="alias to use (default: local-big)")
+    p.set_defaults(func=cmd_summarize)
+
+    p = add(
+        "draft",
+        "draft a commit message, PR body, changelog or tests",
+        "Draft a commit message, PR description, changelog entries or tests with\n"
+        "local-fast.\n\n"
+        "`draft commit` with no file and nothing piped uses `git diff --staged` in\n"
+        "the current directory. Output is the artifact only -- pipe it straight into\n"
+        "`git commit -F -`.",
+    )
+    p.add_argument("kind", choices=sorted(DRAFT_SYSTEMS), help="what to draft")
+    p.add_argument("file", nargs="?", help="file to read; '-' reads stdin")
+    p.add_argument("--context", help="extra context the diff cannot show (ticket, intent)")
+    p.add_argument("--model", help="alias to use (default: local-fast)")
+    p.set_defaults(func=cmd_draft)
+
+    p = add(
+        "ask",
+        "one-shot question",
+        "One-shot question against a local alias.\n\n"
+        "Anything piped on stdin is appended to the prompt as material, so\n"
+        "`cat err.log | local ask 'what broke?'` does what it looks like.",
+    )
+    p.add_argument("prompt", nargs="+", help="the question; '-' reads it from stdin")
+    p.add_argument("--system", help="system prompt")
+    p.add_argument("--model", help="alias to use (default: local-fast)")
+    p.add_argument("--max-tokens", type=int, default=2048, help="response budget (default: 2048)")
+    p.set_defaults(func=cmd_ask)
+
+    p = add(
+        "search",
+        "semantic search across the workspace",
+        "Semantic search across the indexed workspace repositories.\n\n"
+        "Requires an index: run `local index` first. Results are ranked by\n"
+        "embedding similarity, not by keyword, so describe the behaviour you\n"
+        "are looking for rather than guessing at an identifier.",
+    )
+    p.add_argument("query", help="what to look for, in plain language")
+    p.add_argument("--limit", type=int, default=10, help="max hits (default: 10)")
+    p.add_argument("--repo", help="restrict to one repo from config/repos.yaml")
+    p.add_argument("--json", action="store_true", help="emit hits as JSON")
+    p.set_defaults(func=cmd_search)
+
+    p = add(
+        "index",
+        "build or refresh the workspace search index",
+        "Build or refresh the semantic index over the workspace repositories.\n\n"
+        "Incremental by default: unchanged files are skipped. Use --force after\n"
+        "changing the embedding model or if results look stale.",
+    )
+    p.add_argument("--force", action="store_true", help="rebuild from scratch")
+    p.add_argument("--repo", help="index only this repo from config/repos.yaml")
+    p.add_argument("--json", action="store_true", help="emit the stats as JSON")
+    p.set_defaults(func=cmd_index)
+
+    p = add(
+        "models",
+        "show aliases and what they resolve to",
+        "Show every alias, the concrete model it resolves to on the active tier,\n"
+        "and whether the running proxy serves it. Works with the proxy down.",
+    )
+    p.add_argument("--json", action="store_true", help="emit the table as JSON")
+    p.set_defaults(func=cmd_models)
+
+    p = add(
+        "health",
+        "diagnose the harness end to end",
+        "Diagnose the harness: tier, RAM, proxy, ollama, credentials, and one tiny\n"
+        "live completion per alias with timing.\n\n"
+        "Never prints a key value. Exits non-zero when something is broken, so it\n"
+        "works in a pre-flight script.",
+    )
+    p.add_argument("--json", action="store_true", help="emit the report as JSON")
+    p.set_defaults(func=cmd_health)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        parser.print_help(sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except h.HarnessError as exc:
+        h.die(str(exc))
+    except KeyboardInterrupt:
+        h.die("interrupted", code=130)

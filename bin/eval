@@ -1,0 +1,653 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""Replay recorded stumbles against a repo commit and let local-big judge them."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import harness_lib as h
+
+CASES_FILE = "evals/cases.yaml"
+
+# One agent invocation per case. Placeholders are substituted before the string
+# is split with shlex, so a task containing quotes stays a single argument.
+DEFAULT_AGENT_COMMAND = 'claude --print --permission-mode acceptEdits -- {task}'
+DEFAULT_TIMEOUT = 900
+
+# Cap what the judge reads. local-big has a finite window and the tail of a
+# transcript is where the outcome lives.
+TRANSCRIPT_LIMIT = 24000
+
+JUDGE_SYSTEM = (
+    "You are grading one replayed agent session against a known trap. "
+    "Answer only with a single JSON object, no prose and no code fences."
+)
+
+JUDGE_QUESTIONS = [
+    ("right_files", "Did the agent find and work in the right files for the task?"),
+    ("trap_avoided", "Did it avoid the known trap described below?"),
+    ("tests_passed_unaided", "Did the verification pass without a human correcting the agent?"),
+    (
+        "no_rederivation",
+        "Did it avoid re-deriving anything the context file already states outright?",
+    ),
+]
+
+STATUS_ORDER = ("pass", "fail", "inconclusive", "skipped")
+
+
+# --------------------------------------------------------------------------
+# Terminal helpers -- results go to stdout, progress to stderr.
+# --------------------------------------------------------------------------
+
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _b(text: str) -> str:
+    return f"\033[1m{text}\033[0m" if _COLOR else text
+
+
+def _d(text: str) -> str:
+    return f"\033[2m{text}\033[0m" if _COLOR else text
+
+
+def table(headers: list[str], rows: list[list[str]]) -> None:
+    if not rows:
+        print(_d("  (none)"))
+        return
+    widths = [len(x) for x in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt(cells: list[str]) -> str:
+        return "  " + "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells)).rstrip()
+
+    print(_b(fmt(headers)))
+    print(_d(fmt(["-" * w for w in widths])))
+    for row in rows:
+        print(fmt(row))
+
+
+def clip(text: str, width: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+# --------------------------------------------------------------------------
+# Cases
+# --------------------------------------------------------------------------
+
+
+def cases_path() -> Path:
+    return h.harness_root() / CASES_FILE
+
+
+def load_cases() -> list[dict[str, Any]]:
+    path = cases_path()
+    if not path.exists():
+        raise h.HarnessError(f"no {CASES_FILE}; copy the schema comment from the template")
+    data = h.load_yaml(path, default={}) or {}
+    if not isinstance(data, dict):
+        raise h.HarnessError(f"{CASES_FILE}: expected a mapping with a `cases:` key")
+    cases = data.get("cases") or []
+    if not isinstance(cases, list):
+        raise h.HarnessError(f"{CASES_FILE}: `cases:` must be a list")
+    out: list[dict[str, Any]] = []
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            raise h.HarnessError(f"{CASES_FILE}: case #{index + 1} is not a mapping")
+        if not case.get("id"):
+            raise h.HarnessError(f"{CASES_FILE}: case #{index + 1} has no `id`")
+        out.append(case)
+    ids = [c["id"] for c in out]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise h.HarnessError(f"{CASES_FILE}: duplicate case id(s): {', '.join(dupes)}")
+    return out
+
+
+def select(cases: list[dict[str, Any]], case_id: str | None, pattern: str | None) -> list[dict]:
+    selected = cases
+    if case_id:
+        selected = [c for c in selected if c["id"] == case_id]
+        if not selected:
+            raise h.HarnessError(f"no case with id {case_id!r}; try --list")
+    if pattern:
+        try:
+            rx = re.compile(pattern)
+        except re.error as exc:
+            raise h.HarnessError(f"bad --filter regex: {exc}") from exc
+        selected = [
+            c
+            for c in selected
+            if rx.search(str(c["id"])) or rx.search(str(c.get("repo") or ""))
+        ]
+    return selected
+
+
+def case_commit(case: dict[str, Any]) -> str:
+    """The case's rev as a string.
+
+    YAML turns an unquoted all-digit SHA into an int (and eats its leading
+    zeros), so read it defensively and tell people to quote it.
+    """
+    value = case.get("commit")
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def resolve_repo(case: dict[str, Any], cfg: h.Config) -> tuple[Path | None, str]:
+    """Locate the case's checkout. Returns (path, reason-if-unavailable)."""
+    raw = str(case.get("repo") or "").strip()
+    if not raw:
+        return None, "case has no `repo`"
+    if case.get("repo_path"):
+        candidates = [Path(str(case["repo_path"])).expanduser()]
+    elif raw.startswith(("/", "~", ".")):
+        candidates = [Path(raw).expanduser()]
+    else:
+        # A bare name means "the repo of that name in the configured workspace",
+        # which is where bin/sync-workspace puts it.
+        candidates = [cfg.workspace_root / raw]
+    for path in candidates:
+        if (path / ".git").exists():
+            return path.resolve(), ""
+        if path.exists():
+            return None, f"{path} is not a git checkout"
+    return None, f"no checkout at {candidates[0]} (run bin/sync-workspace)"
+
+
+def commit_exists(repo: Path, commit: str) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def render_command(template: str, case: dict[str, Any], worktree: Path) -> list[str]:
+    values = {
+        "task": str(case.get("task") or "").strip(),
+        "id": str(case.get("id")),
+        "repo": str(case.get("repo") or ""),
+        "commit": case_commit(case),
+        "worktree": str(worktree),
+        "trap": str(case.get("trap") or ""),
+    }
+    parts = shlex.split(template)
+    return [part.format(**values) for part in parts]
+
+
+# --------------------------------------------------------------------------
+# Running one case
+# --------------------------------------------------------------------------
+
+
+def run_command(
+    argv: list[str], cwd: Path, timeout: int, env: dict[str, str]
+) -> tuple[int, str, float]:
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return 127, f"command not found: {argv[0]}", time.time() - started
+    except subprocess.TimeoutExpired as exc:
+        partial = (exc.stdout or "") + (exc.stderr or "")
+        if isinstance(partial, bytes):
+            partial = partial.decode(errors="replace")
+        return 124, partial + f"\n[timed out after {timeout}s]", time.time() - started
+    return (
+        proc.returncode,
+        (proc.stdout or "") + (proc.stderr or ""),
+        time.time() - started,
+    )
+
+
+def build_judge_prompt(case: dict[str, Any], transcript: str, verify: dict[str, Any] | None) -> str:
+    context_text = ""
+    for ref in case.get("context_files") or ([case["context_file"]] if case.get("context_file") else []):
+        path = Path(str(ref)).expanduser()
+        if path.exists():
+            context_text += f"\n--- {ref} ---\n{path.read_text(errors='replace')[:6000]}\n"
+        else:
+            context_text += f"\n--- {ref} (not readable from here) ---\n"
+
+    if len(transcript) > TRANSCRIPT_LIMIT:
+        head = transcript[: TRANSCRIPT_LIMIT // 3]
+        tail = transcript[-(TRANSCRIPT_LIMIT - TRANSCRIPT_LIMIT // 3):]
+        transcript = f"{head}\n[... {len(transcript)} chars total, middle elided ...]\n{tail}"
+
+    if verify is None:
+        verify_text = "No verification command was configured for this case."
+    else:
+        verify_text = (
+            f"Verification command: {verify['command']}\n"
+            f"Exit code: {verify['exit_code']}\n"
+            f"Output (tail):\n{verify['output'][-4000:]}"
+        )
+
+    questions = "\n".join(f"- {key}: {text}" for key, text in JUDGE_QUESTIONS)
+    schema = ", ".join(f'"{key}": {{"pass": true, "why": "one line"}}' for key, _ in JUDGE_QUESTIONS)
+
+    return f"""Grade this replayed agent session.
+
+TASK GIVEN TO THE AGENT
+{case.get('task') or '(none recorded)'}
+
+KNOWN TRAP (the real stumble this case was born from)
+{case.get('trap') or '(none recorded)'}
+
+EXPECTED FILES (a correct run touches or reads these; may be empty)
+{', '.join(str(f) for f in (case.get('expect_files') or [])) or '(none recorded)'}
+
+CONTEXT FILE THE FIX ADDED (re-deriving anything stated here is a failure)
+{context_text or '(none provided)'}
+
+VERIFICATION
+{verify_text}
+
+AGENT TRANSCRIPT
+{transcript or '(empty)'}
+
+Answer these four questions:
+{questions}
+
+Reply with exactly this JSON object and nothing else:
+{{{schema}}}
+"""
+
+
+def parse_judge(raw: str) -> tuple[dict[str, Any] | None, str]:
+    """Pull the JSON verdict out of the judge's reply. Never raises."""
+    text = (raw or "").strip()
+    if not text:
+        return None, "judge returned nothing"
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None, "no JSON object in judge reply"
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as exc:
+        return None, f"judge reply is not valid JSON ({exc.msg})"
+    if not isinstance(data, dict):
+        return None, "judge reply is not a JSON object"
+
+    answers: dict[str, Any] = {}
+    for key, _ in JUDGE_QUESTIONS:
+        value = data.get(key)
+        if isinstance(value, bool):
+            value = {"pass": value, "why": ""}
+        if not isinstance(value, dict) or not isinstance(value.get("pass"), bool):
+            return None, f"judge answer for {key!r} is missing or malformed"
+        answers[key] = {"pass": value["pass"], "why": clip(value.get("why") or "", 200)}
+    return answers, ""
+
+
+def run_case(case: dict[str, Any], cfg: h.Config, run_dir: Path) -> dict[str, Any]:
+    case_id = str(case["id"])
+    result: dict[str, Any] = {
+        "id": case_id,
+        "repo": case.get("repo"),
+        "commit": case_commit(case),
+        "trap": case.get("trap"),
+        "status": "inconclusive",
+        "reason": "",
+        "answers": {},
+        "duration_s": 0.0,
+        "transcript": None,
+    }
+    started = time.time()
+
+    if case.get("enabled") is False:
+        result.update(status="skipped", reason="disabled in cases.yaml")
+        return result
+
+    repo, why = resolve_repo(case, cfg)
+    if repo is None:
+        result.update(status="skipped", reason=why)
+        return result
+    commit = case_commit(case)
+    if not commit:
+        result.update(status="skipped", reason="case has no `commit`")
+        return result
+    if not commit_exists(repo, commit):
+        result.update(status="skipped", reason=f"commit {commit} not in {repo} (fetch it first)")
+        return result
+
+    # A detached worktree under var/ means the replay never touches the user's
+    # checkout, index, or branch -- the one thing an eval must not do.
+    worktree = run_dir / "worktrees" / case_id
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    add = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", "--force",
+         str(worktree), commit],
+        capture_output=True,
+        text=True,
+    )
+    if add.returncode != 0:
+        result.update(
+            status="skipped",
+            reason=f"git worktree add failed: {clip(add.stderr or add.stdout, 160)}",
+        )
+        return result
+
+    try:
+        env = dict(os.environ)
+        env["HARNESS_EVAL_CASE"] = case_id
+        template = str(case.get("agent_command") or DEFAULT_AGENT_COMMAND)
+        try:
+            argv = render_command(template, case, worktree)
+        except (KeyError, ValueError) as exc:
+            result.update(status="skipped", reason=f"bad agent_command: {exc}")
+            return result
+        if not argv:
+            result.update(status="skipped", reason="agent_command is empty")
+            return result
+        if shutil.which(argv[0]) is None and not Path(argv[0]).exists():
+            result.update(status="skipped", reason=f"agent command not on PATH: {argv[0]}")
+            return result
+
+        timeout = int(case.get("timeout") or DEFAULT_TIMEOUT)
+        h.step(f"{case_id}: running {argv[0]} in {worktree}")
+        code, transcript, _ = run_command(argv, worktree, timeout, env)
+        transcript = f"$ {' '.join(shlex.quote(a) for a in argv)}\n[exit {code}]\n{transcript}"
+
+        verify_info: dict[str, Any] | None = None
+        verify_cmd = case.get("verify")
+        if verify_cmd:
+            h.step(f"{case_id}: verifying")
+            vcode, vout, _ = run_command(
+                ["bash", "-lc", str(verify_cmd)], worktree, timeout, env
+            )
+            verify_info = {"command": str(verify_cmd), "exit_code": vcode, "output": vout}
+            result["verify_exit_code"] = vcode
+
+        transcript_path = run_dir / f"{case_id}.transcript.txt"
+        transcript_path.write_text(transcript, errors="replace")
+        result["transcript"] = str(transcript_path)
+
+        h.step(f"{case_id}: judging with local-big")
+        try:
+            reply = h.chat(
+                build_judge_prompt(case, transcript, verify_info),
+                model="local-big",
+                system=JUDGE_SYSTEM,
+                temperature=0.0,
+                max_tokens=800,
+                cfg=cfg,
+                tool="eval:judge",
+            )
+        except h.HarnessError as exc:
+            result.update(status="inconclusive", reason=f"judge unavailable: {exc}")
+            return result
+
+        answers, problem = parse_judge(reply)
+        if answers is None:
+            (run_dir / f"{case_id}.judge-raw.txt").write_text(reply or "", errors="replace")
+            result.update(status="inconclusive", reason=problem)
+            return result
+
+        result["answers"] = answers
+        failed = [k for k, v in answers.items() if not v["pass"]]
+        result["status"] = "pass" if not failed else "fail"
+        result["reason"] = (
+            "" if not failed else "; ".join(f"{k}: {answers[k]['why']}" for k in failed)
+        )
+        return result
+    finally:
+        result["duration_s"] = round(time.time() - started, 1)
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)],
+            capture_output=True,
+            text=True,
+        )
+        if worktree.exists():
+            shutil.rmtree(worktree, ignore_errors=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "prune"], capture_output=True, text=True
+        )
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+
+def print_list(cases: list[dict[str, Any]]) -> None:
+    print(_b(f"{len(cases)} case(s) in {CASES_FILE}"))
+    table(
+        ["id", "repo", "commit", "trap"],
+        [
+            [
+                str(c["id"]),
+                clip(c.get("repo") or "-", 28),
+                clip(case_commit(c)[:12] or "-", 12),
+                clip(c.get("trap") or "-", 60),
+            ]
+            for c in cases
+        ],
+    )
+
+
+def print_dry_run(cases: list[dict[str, Any]], cfg: h.Config, run_dir: Path) -> None:
+    print(_b(f"dry run: {len(cases)} case(s) would execute"))
+    print(_d(f"  scratch dir      {run_dir}"))
+    print(_d(f"  workspace root   {cfg.workspace_root}"))
+    print(_d("  judge            local-big"))
+    for case in cases:
+        case_id = str(case["id"])
+        repo, why = resolve_repo(case, cfg)
+        print()
+        print(_b(f"  {case_id}"))
+        print(f"    repo      {repo or '(unavailable: ' + why + ')'}")
+        commit = case_commit(case)
+        if repo and commit:
+            state = "present" if commit_exists(repo, commit) else "MISSING -> would skip"
+            print(f"    commit    {commit}  ({state})")
+        else:
+            print(f"    commit    {commit or '(none) -> would skip'}")
+        worktree = run_dir / "worktrees" / case_id
+        print(f"    worktree  git worktree add --detach {worktree} {commit or '<commit>'}")
+        template = str(case.get("agent_command") or DEFAULT_AGENT_COMMAND)
+        try:
+            argv = render_command(template, case, worktree)
+            rendered = " ".join(shlex.quote(a) for a in argv)
+        except (KeyError, ValueError) as exc:
+            rendered = f"(bad agent_command: {exc})"
+        print(f"    agent     {clip(rendered, 160)}")
+        print(f"    verify    {case.get('verify') or '(none)'}")
+        print(f"    timeout   {int(case.get('timeout') or DEFAULT_TIMEOUT)}s")
+        print(f"    cleanup   git worktree remove --force {worktree}")
+
+
+def print_summary(results: list[dict[str, Any]], run_dir: Path) -> None:
+    print()
+    print(_b("summary"))
+    table(
+        ["case", "status", "secs", "detail"],
+        [
+            [
+                r["id"],
+                r["status"],
+                f"{r['duration_s']:.0f}",
+                clip(r["reason"] or "all four checks passed", 64),
+            ]
+            for r in results
+        ],
+    )
+    counts = {s: sum(1 for r in results if r["status"] == s) for s in STATUS_ORDER}
+    print()
+    print("  " + "   ".join(f"{s} {counts[s]}" for s in STATUS_ORDER))
+    if any(r.get("transcript") for r in results):
+        print(_d(f"  transcripts: {run_dir}"))
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="eval",
+        description="Replay recorded stumbles; local-big judges the transcripts.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Each case in {CASES_FILE} is a task + a repo commit + a known trap, born from a
+real stumble. The stumble is the failing test; the context-file diff is the fix;
+replaying the case proves the fix still holds.
+
+Every case runs in a detached `git worktree` under var/ and the worktree is
+removed afterwards -- your working tree, index and branch are never touched. A
+case whose repo or commit is unavailable is reported `skipped`, never fatal.
+
+local-big grades each transcript on the four questions:
+  right files found? trap avoided? tests passed without correction?
+  did it re-derive anything the context file already states?
+
+  bin/eval --list                 ids, repos, traps
+  bin/eval --dry-run              show what would run, touch nothing
+  bin/eval --case api-migrations  one case
+  bin/eval --filter 'auth|db'     regex over case id and repo
+  bin/eval --json                 machine-readable results
+
+NOT FOR CI. Runs are slow, need real checkouts and a running LiteLLM proxy, and
+the judge is a language model -- its verdicts are informative, not gating. Run
+this by hand before and after a context-file change, and quarterly. Exit status
+is 0 regardless of verdicts unless you pass --strict.
+""",
+    )
+    parser.add_argument("--case", metavar="ID", help="run one case by id")
+    parser.add_argument("--filter", metavar="PATTERN", help="regex matched against case id and repo")
+    parser.add_argument("--list", action="store_true", help="list cases and exit")
+    parser.add_argument("--dry-run", action="store_true", help="show what would run; change nothing")
+    parser.add_argument("--json", action="store_true", help="emit results as JSON on stdout")
+    parser.add_argument(
+        "--strict", action="store_true", help="exit non-zero if any case fails or is inconclusive"
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    cases = load_cases()
+
+    if not cases:
+        message = (
+            "no cases yet, which is the expected state for a fresh harness; a case is "
+            "born the first time an agent stumbles on something real. See evals/README.md."
+        )
+        if args.json:
+            json.dump(
+                {"cases": [], "results": [], "counts": {s: 0 for s in STATUS_ORDER},
+                 "note": message},
+                sys.stdout,
+                indent=2,
+            )
+            print()
+        else:
+            print(_b(f"0 cases in {CASES_FILE}"))
+            print(_d("  No cases yet, which is the expected state for a fresh harness."))
+            print(_d("  A case is born the first time an agent stumbles on something real."))
+            print(_d("  See evals/README.md."))
+        return 0
+
+    selected = select(cases, args.case, args.filter)
+    if not selected:
+        h.warn("no cases matched the filter")
+        return 0
+
+    if args.list:
+        if args.json:
+            json.dump(
+                [
+                    {"id": c["id"], "repo": c.get("repo"), "commit": case_commit(c),
+                     "trap": c.get("trap")}
+                    for c in selected
+                ],
+                sys.stdout,
+                indent=2,
+            )
+            print()
+        else:
+            print_list(selected)
+        return 0
+
+    cfg = h.load_config(required=False)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = h.var_dir() / "eval-runs" / stamp
+
+    if args.dry_run:
+        print_dry_run(selected, cfg, run_dir)
+        return 0
+
+    if not h.litellm_up(cfg):
+        raise h.HarnessError(
+            f"LiteLLM is not answering at {cfg.base_url}, so local-big cannot judge "
+            "anything. Start the proxy with `./setup.sh --start` and re-run."
+        )
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    try:
+        for case in selected:
+            results.append(run_case(case, cfg, run_dir))
+    except KeyboardInterrupt:
+        h.warn("interrupted; worktrees for finished cases were cleaned up")
+
+    if args.json:
+        json.dump(
+            {
+                "run_dir": str(run_dir),
+                "results": results,
+                "counts": {s: sum(1 for r in results if r["status"] == s) for s in STATUS_ORDER},
+            },
+            sys.stdout,
+            indent=2,
+            default=str,
+        )
+        print()
+    else:
+        print_summary(results, run_dir)
+
+    if args.strict and any(r["status"] in ("fail", "inconclusive") for r in results):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except h.HarnessError as exc:
+        h.die(str(exc))
+    except KeyboardInterrupt:
+        h.die("interrupted", code=130)

@@ -1,0 +1,264 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""Clone or fast-forward every repo in config/repos.yaml under the workspace root."""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import harness_lib as h  # noqa: E402
+
+# Outcomes, in the order the summary prints them.
+OUTCOMES = ("cloned", "pulled", "up-to-date", "skipped", "failed")
+
+EPILOG = """\
+This never discards local work. A checkout that is dirty, on a branch other than the
+configured one, or missing an upstream is reported and left exactly as it is -- the
+only write operations are `git clone` and `git pull --ff-only`.
+
+examples
+--------
+  bin/sync-workspace                  clone or fast-forward everything, 4 at a time
+  bin/sync-workspace --dry-run        print what it would do, touch nothing
+  bin/sync-workspace --repo acme-api  one repo (repeatable)
+  bin/sync-workspace --jobs 8 --json  machine-readable results on stdout
+"""
+
+
+@dataclass
+class Result:
+    name: str
+    path: Path
+    outcome: str = "failed"
+    detail: str = ""
+    lines: list[str] = field(default_factory=list)
+
+    def log(self, msg: str) -> None:
+        self.lines.append(msg)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "path": str(self.path),
+            "outcome": self.outcome,
+            "detail": self.detail,
+        }
+
+
+def git(*args: str, cwd: Path | None = None, timeout: float = 600.0) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _fail_detail(proc: subprocess.CompletedProcess) -> str:
+    text = (proc.stderr or proc.stdout or "").strip()
+    return text.splitlines()[-1] if text else f"git exited {proc.returncode}"
+
+
+def clone(repo: dict[str, Any], dest: Path, dry_run: bool, res: Result) -> Result:
+    branch = repo.get("branch")
+    args = ["clone"]
+    if branch:
+        args += ["--branch", str(branch)]
+    args += ["--", str(repo["remote"]), str(dest)]
+    if dry_run:
+        res.outcome = "cloned"
+        res.detail = "would clone"
+        res.log(f"would run: git {' '.join(args)}")
+        return res
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    proc = git(*args)
+    if proc.returncode != 0:
+        res.outcome, res.detail = "failed", _fail_detail(proc)
+        res.log(f"clone failed: {res.detail}")
+        return res
+    res.outcome = "cloned"
+    res.detail = f"from {repo['remote']}"
+    res.log(f"cloned {repo['remote']}" + (f" ({branch})" if branch else ""))
+    return res
+
+
+def update(repo: dict[str, Any], dest: Path, dry_run: bool, res: Result) -> Result:
+    if not (dest / ".git").exists():
+        res.outcome, res.detail = "skipped", "path exists but is not a git checkout"
+        res.log(res.detail)
+        return res
+
+    status = git("status", "--porcelain", cwd=dest)
+    if status.returncode != 0:
+        res.outcome, res.detail = "failed", _fail_detail(status)
+        res.log(f"git status failed: {res.detail}")
+        return res
+    dirty = [line for line in status.stdout.splitlines() if line.strip()]
+    if dirty:
+        res.outcome = "skipped"
+        res.detail = f"{len(dirty)} uncommitted change(s)"
+        res.log(f"dirty ({res.detail}) -- left alone")
+        return res
+
+    head = git("rev-parse", "--abbrev-ref", "HEAD", cwd=dest)
+    current = head.stdout.strip() if head.returncode == 0 else ""
+    wanted = str(repo.get("branch") or "").strip()
+    if wanted and current and current != wanted:
+        res.outcome = "skipped"
+        res.detail = f"on {current}, configured branch is {wanted}"
+        res.log(f"{res.detail} -- not switching branches for you")
+        return res
+    if current == "HEAD":
+        res.outcome, res.detail = "skipped", "detached HEAD"
+        res.log("detached HEAD -- left alone")
+        return res
+
+    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", cwd=dest)
+    if upstream.returncode != 0:
+        res.outcome, res.detail = "skipped", f"{current} has no upstream"
+        res.log(f"{res.detail} -- nothing to fast-forward from")
+        return res
+
+    if dry_run:
+        res.outcome = "pulled"
+        res.detail = f"would pull --ff-only {current}"
+        res.log(f"would run: git pull --ff-only  ({current} -> {upstream.stdout.strip()})")
+        return res
+
+    before = git("rev-parse", "HEAD", cwd=dest).stdout.strip()
+    pull = git("pull", "--ff-only", cwd=dest)
+    if pull.returncode != 0:
+        res.outcome, res.detail = "failed", _fail_detail(pull)
+        res.log(f"pull failed: {res.detail}")
+        return res
+    after = git("rev-parse", "HEAD", cwd=dest).stdout.strip()
+    if before == after:
+        res.outcome, res.detail = "up-to-date", current
+        res.log(f"up to date on {current}")
+    else:
+        res.outcome, res.detail = "pulled", f"{before[:8]}..{after[:8]}"
+        res.log(f"fast-forwarded {current} {before[:8]}..{after[:8]}")
+    return res
+
+
+def sync_one(repo: dict[str, Any], workspace: Path, dry_run: bool) -> Result:
+    dest = workspace / str(repo["name"])
+    res = Result(name=str(repo["name"]), path=dest)
+    try:
+        if dest.exists():
+            return update(repo, dest, dry_run, res)
+        return clone(repo, dest, dry_run, res)
+    except subprocess.TimeoutExpired:
+        res.outcome, res.detail = "failed", "git timed out"
+        res.log(res.detail)
+    except OSError as exc:
+        res.outcome, res.detail = "failed", str(exc)
+        res.log(res.detail)
+    return res
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="bin/sync-workspace",
+        description=(
+            "Clone every repo in config/repos.yaml as a sibling under workspace_root, "
+            "and fast-forward the ones already there."
+        ),
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
+    p.add_argument(
+        "--repo", action="append", metavar="NAME", help="only this repo (repeatable)"
+    )
+    p.add_argument("--jobs", type=int, default=4, metavar="N", help="parallel git jobs (default 4)")
+    p.add_argument("--json", action="store_true", help="write results as JSON on stdout")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.jobs < 1:
+        raise h.HarnessError("--jobs must be at least 1")
+
+    cfg = h.load_config()
+    repos = h.load_repos()
+    if not repos:
+        raise h.HarnessError(
+            "no repos in config/repos.yaml -- add them there, or re-run `bin/init`."
+        )
+    if args.repo:
+        wanted = set(args.repo)
+        missing = wanted - {str(r["name"]) for r in repos}
+        if missing:
+            raise h.HarnessError(f"not in config/repos.yaml: {', '.join(sorted(missing))}")
+        repos = [r for r in repos if str(r["name"]) in wanted]
+    for r in repos:
+        if not r.get("remote"):
+            raise h.HarnessError(f"repo {r['name']!r} has no remote in config/repos.yaml")
+
+    workspace = cfg.workspace_root
+    h.step(
+        f"{'Planning' if args.dry_run else 'Syncing'} {len(repos)} repo(s) into {workspace}"
+        + (f" ({args.jobs} jobs)" if args.jobs > 1 and not args.dry_run else "")
+    )
+    if not args.dry_run:
+        workspace.mkdir(parents=True, exist_ok=True)
+
+    results: list[Result] = []
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = {pool.submit(sync_one, r, workspace, args.dry_run): r for r in repos}
+        for future in as_completed(futures):
+            res = future.result()
+            results.append(res)
+            # Printed here, in the main thread, so one repo's lines stay together.
+            emit = h.warn if res.outcome in ("skipped", "failed") else h.ok
+            emit(f"{res.name}")
+            for line in res.lines:
+                h.info(f"      {line}")
+
+    results.sort(key=lambda r: r.name)
+    counts = {outcome: 0 for outcome in OUTCOMES}
+    for res in results:
+        counts[res.outcome] = counts.get(res.outcome, 0) + 1
+
+    h.info("")
+    h.step("Summary" + (" (dry run -- nothing was changed)" if args.dry_run else ""))
+    width = max(len(r.name) for r in results)
+    for res in results:
+        h.info(f"  {res.name.ljust(width)}  {res.outcome:11} {res.detail}")
+    h.info("  " + "-" * (width + 40))
+    h.info("  " + "  ".join(f"{name}: {counts[name]}" for name in OUTCOMES))
+    if counts["skipped"]:
+        h.info("  Skipped repos were left untouched on purpose; resolve them by hand.")
+
+    if args.json:
+        json.dump(
+            {"workspace_root": str(workspace), "dry_run": args.dry_run,
+             "counts": counts, "repos": [r.to_dict() for r in results]},
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+
+    return 1 if counts["failed"] else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except h.HarnessError as exc:
+        h.die(str(exc))
+    except KeyboardInterrupt:
+        h.die("interrupted", 130)
