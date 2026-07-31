@@ -55,6 +55,17 @@ litellm_settings:
     - local-big: [local-big-remote]
   drop_params: true
 
+  # Response cache: an identical request within the TTL replays from disk --
+  # free and instant. Biggest wins: re-compressing an unchanged log, repeated
+  # search queries. The cache key includes the full request (model, messages,
+  # temperature), so different prompts never collide. Lives in var/litellm-cache
+  # (setup.sh pins the working directory); delete that directory to clear.
+  cache: true
+  cache_params:
+    type: disk
+    disk_cache_dir: var/litellm-cache
+    ttl: 86400
+
 general_settings:
   # setup.sh exports LITELLM_MASTER_KEY=sk-harness-local when it is unset, so the
   # default path works with no secrets configured. Set your own in .envrc if the

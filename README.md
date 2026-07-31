@@ -199,6 +199,20 @@ building it: a trivial delegated review costs ~36k input tokens. Delegation is n
 routed automatically and never free — `usage-report` shows exactly what it cost, and the
 kill rule applies to it like everything else.
 
+### Caching (what repeats is free)
+
+Three layers, two of them automatic. Frontier caching is the vendors' problem —
+`usage-report` just shows you the cache read/write tokens from your transcripts. Ollama's
+KV prefix cache makes the offload tools' static system prompts nearly free to re-send, as
+long as the model stays loaded — which is why `keep_alive` is 10m on the 32GB tier, not
+2m (the trade: ~14GB stays resident between calls; drop it in `config/tier-overrides.yaml`
+if the machine swaps). The harness adds the third layer itself: a disk response cache in
+the LiteLLM proxy (24h TTL, lives in `var/litellm-cache`, delete the directory to clear).
+An identical request — re-compressing an unchanged log, repeating a search query — replays
+instantly and free, which matters most on the 32GB hosted rung where repeats otherwise
+cost real money. Cache hits stay visible: `usage-report` labels them and counts the tokens
+that were never re-computed.
+
 ### What NOT to build
 
 - **No automatic router.** Explicit invocation only. Revisit in 3 months if the explicit

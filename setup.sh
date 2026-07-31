@@ -373,15 +373,33 @@ resolve_litellm_bin() {
   return 1
 }
 
+# The response cache's disk backend imports `diskcache`, which litellm[proxy]
+# does not bundle. Check with the tool's own interpreter, not the system one.
+litellm_has_diskcache() {
+  local py
+  py="$(dirname "$LITELLM_BIN")/python"
+  [ -x "$py" ] && "$py" -c "import diskcache" >/dev/null 2>&1
+}
+
 litellm_step() {
   step "LiteLLM proxy binary"
   if resolve_litellm_bin; then
     ok "litellm present: $LITELLM_BIN"
+    if ! litellm_has_diskcache; then
+      # Installs that predate the response cache lack diskcache; retrofit it.
+      dry "uv tool install --force \"litellm[proxy]\" --with diskcache" && return 0
+      info "  adding diskcache (response-cache backend) to the litellm install"
+      if uv tool install --force "litellm[proxy]" --with diskcache; then
+        ok "diskcache added"
+      else
+        fail_soft "could not add diskcache; the proxy will run with response caching disabled"
+      fi
+    fi
     return 0
   fi
-  dry "uv tool install \"litellm[proxy]\"" && { LITELLM_BIN="$HOME/.local/bin/litellm"; return 0; }
+  dry "uv tool install \"litellm[proxy]\" --with diskcache" && { LITELLM_BIN="$HOME/.local/bin/litellm"; return 0; }
   info "  installing litellm[proxy] with uv (no Homebrew formula exists)"
-  if ! uv tool install "litellm[proxy]"; then
+  if ! uv tool install "litellm[proxy]" --with diskcache; then
     fail_soft "uv tool install \"litellm[proxy]\" failed; retry manually, then re-run ./setup.sh"
     return 1
   fi
@@ -667,10 +685,13 @@ start_proxy() {
     printf '\n===== %s  setup.sh starting %s (tier %s) =====\n' \
       "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$PROFILE" "$TIER"
   } >> "$LOG_FILE"
-  nohup "$LITELLM_BIN" --config "$PROFILE" --host "$LITELLM_HOST" --port "$LITELLM_PORT" \
-    >> "$LOG_FILE" 2>&1 &
-  local pid=$!
-  printf '%s' "$pid" > "$PID_FILE"
+  # cwd is pinned to the harness root so the profile's relative
+  # disk_cache_dir (var/litellm-cache) always lands in var/, no matter
+  # where setup.sh was invoked from.
+  ( cd "$ROOT" && nohup "$LITELLM_BIN" --config "$PROFILE" --host "$LITELLM_HOST" --port "$LITELLM_PORT" \
+    >> "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE" )
+  local pid
+  pid="$(cat "$PID_FILE")"
 
   local waited=0
   while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do

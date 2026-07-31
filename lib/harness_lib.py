@@ -109,7 +109,12 @@ DEFAULT_MODELS: dict[str, dict[str, str]] = {
         "local-fast": "ollama/qwen2.5-coder:7b",
         "local-embed": "ollama/nomic-embed-text",
         "local-big-remote": "openai/qwen2.5-72b-instruct",
-        "keep_alive": "2m",
+        # 10m, not the obvious 2m: Ollama's KV prefix cache only survives while
+        # the model stays loaded, and the static system prompts in compress/
+        # draft are exactly the prefixes worth keeping warm. Costs ~14GB
+        # resident (14B degraded + 7B sprinter) for the duration; drop it back
+        # via keep_alive in config/tier-overrides.yaml if the machine swaps.
+        "keep_alive": "10m",
     },
 }
 
@@ -139,6 +144,7 @@ class Completion(str):
         "model_resolved",
         "route",
         "fallback",
+        "cached",
         "prompt_tokens",
         "completion_tokens",
         "duration_ms",
@@ -150,6 +156,7 @@ class Completion(str):
         obj.model_resolved = meta.get("model_resolved", "")
         obj.route = meta.get("route", "local")
         obj.fallback = bool(meta.get("fallback", False))
+        obj.cached = bool(meta.get("cached", False))
         obj.prompt_tokens = int(meta.get("prompt_tokens") or 0)
         obj.completion_tokens = int(meta.get("completion_tokens") or 0)
         obj.duration_ms = int(meta.get("duration_ms") or 0)
@@ -400,7 +407,15 @@ def _api_key() -> str:
     return os.environ.get("LITELLM_MASTER_KEY") or DEFAULT_MASTER_KEY
 
 
-def _post(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+def _post(
+    url: str, payload: dict[str, Any], timeout: float
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """POST and return (json body, lower-cased response headers).
+
+    Headers matter because the proxy signals a response-cache hit there
+    (``x-litellm-cache-key`` plus a zero-ish overhead duration) -- the body of
+    a replayed response is indistinguishable from a fresh one by design.
+    """
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         url,
@@ -412,7 +427,21 @@ def _post(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+        headers = {k.lower(): v for k, v in resp.headers.items()}
+        return json.loads(resp.read().decode()), headers
+
+
+def _cache_hit(headers: dict[str, str]) -> bool:
+    """True when the proxy answered from its response cache.
+
+    Verified against LiteLLM 1.93.0 by diffing a miss/hit pair: the
+    ``x-litellm-cache-key`` header is sent ONLY on a replay (the miss that
+    stores the entry does not carry it), so its presence is the discriminator.
+    The same pair showed 4800ms vs 0.4ms response duration. If a future
+    LiteLLM starts sending the key on misses too, cache hits will overcount
+    -- re-verify this pair after upgrades.
+    """
+    return bool(headers.get("x-litellm-cache-key"))
 
 
 def litellm_up(cfg: Config | None = None, timeout: float = 2.0) -> bool:
@@ -460,7 +489,7 @@ def chat(
     }
     started = time.time()
     try:
-        data = _post(f"{cfg.base_url}/chat/completions", payload, timeout)
+        data, resp_headers = _post(f"{cfg.base_url}/chat/completions", payload, timeout)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:400]
         log_usage(
@@ -488,6 +517,7 @@ def chat(
     resolved = str(data.get("model") or model)
     duration_ms = int((time.time() - started) * 1000)
     fell_back = _is_fallback(resolved, model)
+    cached = _cache_hit(resp_headers)
     log_usage(
         tool=tool,
         alias=model,
@@ -497,6 +527,7 @@ def chat(
         completion_tokens=usage.get("completion_tokens", 0),
         duration_ms=duration_ms,
         fallback=fell_back,
+        cached=cached,
         ok=True,
     )
     choices = data.get("choices") or []
@@ -521,6 +552,7 @@ def chat(
         model_resolved=resolved,
         route=_route_of(resolved, model),
         fallback=fell_back,
+        cached=cached,
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         duration_ms=duration_ms,
@@ -539,7 +571,9 @@ def embed(
     cfg = cfg or load_config(required=False)
     started = time.time()
     try:
-        data = _post(f"{cfg.base_url}/embeddings", {"model": model, "input": list(texts)}, timeout)
+        data, resp_headers = _post(
+            f"{cfg.base_url}/embeddings", {"model": model, "input": list(texts)}, timeout
+        )
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:400]
         raise HarnessError(f"{model}: HTTP {exc.code} from LiteLLM -- {detail}") from exc
@@ -555,6 +589,11 @@ def embed(
         route="local",
         prompt_tokens=usage.get("prompt_tokens", 0),
         duration_ms=int((time.time() - started) * 1000),
+        # Known undercount: LiteLLM 1.93.0 attaches the cache-key header on
+        # chat replays but not on embedding replays (measured: an 86ms -> 6ms
+        # embed pair carried no header either time). Embedding hits therefore
+        # log cached=false. Honest direction -- never claim a hit unproven.
+        cached=_cache_hit(resp_headers),
         ok=True,
     )
     rows = sorted(data.get("data") or [], key=lambda d: d.get("index", 0))

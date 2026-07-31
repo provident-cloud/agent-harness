@@ -5,8 +5,11 @@
 # nowhere else -- to pin different models for your team, edit config/tier-overrides.yaml
 # rather than this file, so upstream updates keep merging cleanly.
 #
-# Intended OLLAMA_KEEP_ALIVE for this tier: 2m. On a 32GB machine the models compete
-# with Docker, the IDE, and the browser, so they unload almost immediately after use.
+# Intended OLLAMA_KEEP_ALIVE for this tier: 10m. Ollama's KV prefix cache only
+# survives while a model stays loaded, and the static system prompts in the
+# offload tools are exactly the prefixes worth keeping warm. The trade: up to
+# ~14GB stays resident between calls. If the machine starts swapping under
+# Docker/IDE load, drop keep_alive back down in config/tier-overrides.yaml.
 #
 # This tier makes one deliberate trade the others do not: local-big is HOSTED.
 # A weak local summarizer that quietly drops details costs more than it saves -- you
@@ -47,7 +50,7 @@ model_list:
     litellm_params:
       model: ollama/qwen2.5-coder:14b
       api_base: http://127.0.0.1:11434
-      keep_alive: 2m
+      keep_alive: 10m
     model_info:
       mode: chat
 
@@ -57,7 +60,7 @@ model_list:
     litellm_params:
       model: ollama/qwen2.5-coder:7b
       api_base: http://127.0.0.1:11434
-      keep_alive: 2m
+      keep_alive: 10m
     model_info:
       mode: chat
 
@@ -65,7 +68,7 @@ model_list:
     litellm_params:
       model: ollama/nomic-embed-text
       api_base: http://127.0.0.1:11434
-      keep_alive: 2m
+      keep_alive: 10m
     model_info:
       mode: embedding
 
@@ -78,6 +81,17 @@ litellm_settings:
   fallbacks:
     - local-big: [local-big-remote, local-big-degraded]
   drop_params: true
+
+  # Response cache: an identical request within the TTL replays from disk --
+  # free and instant. Biggest wins: re-compressing an unchanged log, repeated
+  # search queries. The cache key includes the full request (model, messages,
+  # temperature), so different prompts never collide. Lives in var/litellm-cache
+  # (setup.sh pins the working directory); delete that directory to clear.
+  cache: true
+  cache_params:
+    type: disk
+    disk_cache_dir: var/litellm-cache
+    ttl: 86400
 
 general_settings:
   # setup.sh exports LITELLM_MASTER_KEY=sk-harness-local when it is unset, so the
