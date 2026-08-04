@@ -1,0 +1,23 @@
+# bin/init --answers input that reproduces this team's config/ on any machine.
+version: 1
+team: turbolapper
+workspace_root: ~/Documents/repos
+tier: auto
+repos:
+- name: turbolapper-mac
+  remote: git@github-personal:adviserlabs/turbolapper-super-mac.git
+  branch: main
+  description: Superset macOS app -- Local Data Connector with GUI, MCP server, CLI,
+    multi-provider auto-modeling.
+- name: turbolapper-fm-mac
+  remote: git@github-personal:adviserlabs/turbolapper-fm-mac.git
+  branch: main
+  description: Apple Foundation Models edition -- streamlined on-device report builder,
+    forked from the superset.
+oss:
+  enabled: false
+  base_url: https://models.mixlayer.ai/v1
+  api_key_env: OSS_API_KEY
+frontier:
+  enabled: true
+  api_key_env: ANTHROPIC_API_KEY
