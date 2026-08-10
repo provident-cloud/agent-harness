@@ -1,7 +1,11 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mcp>=1.9", "pyyaml"]
+# # mcp 2.0.0 removed mcp.server.fastmcp (the server package was restructured
+# # around mcp.server.mcpserver). This file targets the FastMCP API, so an
+# # unpinned `mcp>=1.9` resolves to 2.x and the server dies at import with
+# # "No module named 'mcp.server.fastmcp'". 1.29.x is the last line that works.
+# dependencies = ["mcp>=1.9,<2", "pyyaml"]
 # ///
 """Offload MCP server: three tools that move bulk token work onto local models.
 

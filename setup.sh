@@ -356,6 +356,20 @@ brew_step() {
 
 LITELLM_BIN=""
 
+# FastAPI dropped `get_flat_dependant` in 0.140.x, but litellm[proxy] still imports it
+# from fastapi.dependencies.utils and declares only `fastapi>=0.136.3,<1.0` -- so an
+# unconstrained resolve installs a FastAPI that breaks litellm's own proxy import.
+#
+# It does NOT surface as a FastAPI error. litellm catches the real ImportError and
+# retries a bare `from proxy_server import ...`, so the traceback you actually get is
+# a misleading "ModuleNotFoundError: No module named 'proxy_server'". If you ever see
+# that, suspect this pin before anything else, and get the real cause with:
+#   ~/.local/share/uv/tools/litellm/bin/python -c "import litellm.proxy.proxy_server"
+#
+# 0.139.x is the newest FastAPI that works and still satisfies litellm's own range.
+# Bisected 2026-08-10 against litellm 1.96.0: 0.139.0 has the symbol, 0.140.13 does not.
+LITELLM_PIN_FASTAPI="fastapi<0.140"
+
 resolve_litellm_bin() {
   if have litellm; then
     LITELLM_BIN="$(command -v litellm)"
@@ -375,9 +389,21 @@ resolve_litellm_bin() {
 
 # The response cache's disk backend imports `diskcache`, which litellm[proxy]
 # does not bundle. Check with the tool's own interpreter, not the system one.
+#
+# $LITELLM_BIN is normally ~/.local/bin/litellm, a SYMLINK into the uv tool dir.
+# dirname() on the link gives ~/.local/bin, which holds no interpreter -- so the
+# naive path always failed the -x test, reported diskcache missing even when it was
+# installed, and made every run force-reinstall litellm. Resolve the link first.
 litellm_has_diskcache() {
-  local py
-  py="$(dirname "$LITELLM_BIN")/python"
+  local target py
+  target="$(readlink "$LITELLM_BIN" 2>/dev/null || true)"
+  [ -n "$target" ] || target="$LITELLM_BIN"
+  # A relative symlink resolves against the link's own directory.
+  case "$target" in
+    /*) ;;
+    *)  target="$(dirname "$LITELLM_BIN")/$target" ;;
+  esac
+  py="$(dirname "$target")/python"
   [ -x "$py" ] && "$py" -c "import diskcache" >/dev/null 2>&1
 }
 
@@ -387,9 +413,9 @@ litellm_step() {
     ok "litellm present: $LITELLM_BIN"
     if ! litellm_has_diskcache; then
       # Installs that predate the response cache lack diskcache; retrofit it.
-      dry "uv tool install --force \"litellm[proxy]\" --with diskcache" && return 0
+      dry "uv tool install --force \"litellm[proxy]\" --with diskcache --with \"$LITELLM_PIN_FASTAPI\"" && return 0
       info "  adding diskcache (response-cache backend) to the litellm install"
-      if uv tool install --force "litellm[proxy]" --with diskcache; then
+      if uv tool install --force "litellm[proxy]" --with diskcache --with "$LITELLM_PIN_FASTAPI"; then
         ok "diskcache added"
       else
         fail_soft "could not add diskcache; the proxy will run with response caching disabled"
@@ -397,9 +423,9 @@ litellm_step() {
     fi
     return 0
   fi
-  dry "uv tool install \"litellm[proxy]\" --with diskcache" && { LITELLM_BIN="$HOME/.local/bin/litellm"; return 0; }
+  dry "uv tool install \"litellm[proxy]\" --with diskcache --with \"$LITELLM_PIN_FASTAPI\"" && { LITELLM_BIN="$HOME/.local/bin/litellm"; return 0; }
   info "  installing litellm[proxy] with uv (no Homebrew formula exists)"
-  if ! uv tool install "litellm[proxy]" --with diskcache; then
+  if ! uv tool install "litellm[proxy]" --with diskcache --with "$LITELLM_PIN_FASTAPI"; then
     fail_soft "uv tool install \"litellm[proxy]\" failed; retry manually, then re-run ./setup.sh"
     return 1
   fi
@@ -688,8 +714,21 @@ start_proxy() {
   # cwd is pinned to the harness root so the profile's relative
   # disk_cache_dir (var/litellm-cache) always lands in var/, no matter
   # where setup.sh was invoked from.
-  ( cd "$ROOT" && nohup "$LITELLM_BIN" --config "$PROFILE" --host "$LITELLM_HOST" --port "$LITELLM_PORT" \
-    >> "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE" )
+  #
+  # `exec` matters. Without it, `( cd X && nohup litellm ... & echo $! )` parses as
+  # `{ cd X && nohup litellm ...; } &` -- the & binds to the whole && list, so the
+  # shell forks a WRAPPER subshell and $! is the wrapper's pid, not litellm's. The
+  # pidfile then names a process that is not the proxy: --stop kills the wrapper and
+  # leaves a nohup'd litellm holding the port, so the next --start cannot bind it.
+  # (A forked bash subshell reports the parent's command line in ps, which makes this
+  # look like "setup.sh is still running" rather than a stray daemon.)
+  #
+  # exec replaces the subshell with litellm itself: one process, $! is genuinely its
+  # pid, and the >> redirect means it stops holding setup.sh's inherited stdout --
+  # otherwise piping setup.sh into anything never sees EOF while the proxy lives.
+  ( cd "$ROOT" && exec nohup "$LITELLM_BIN" --config "$PROFILE" --host "$LITELLM_HOST" --port "$LITELLM_PORT" \
+    >> "$LOG_FILE" 2>&1 ) &
+  echo $! > "$PID_FILE"
   local pid
   pid="$(cat "$PID_FILE")"
 
