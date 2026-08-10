@@ -2,7 +2,8 @@
      style). Hand-edited copies are never replaced without --force. Edit freely. -->
 # TurboLapper workspace
 
-Loaded into every agent session started in `/Users/ericloflin/Documents/repos`
+Loaded into every agent session started in the workspace root (`workspace_root` in
+`instantiation/turbolapper.answers.yaml`, by default `~/Documents/repos`)
 (`CLAUDE.md` and `AGENTS.md` there are symlinks to this file). Two macOS apps for
 on-device data analysis, one fork relationship. Other sibling directories under this
 workspace root are unrelated projects — ignore them.
