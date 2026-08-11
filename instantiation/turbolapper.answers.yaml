@@ -1,7 +1,11 @@
 # bin/init --answers input that reproduces this team's config/ on any machine.
 version: 1
 team: turbolapper
-workspace_root: ~/Documents/repos
+# The tree Claude Code actually opens. This must match where you work: a
+# workspace_root pointing at a second, unused clone yields an index that
+# silently describes stale code. (Was ~/Documents/repos, which held clones
+# 4 days behind origin that no Claude session had ever opened.)
+workspace_root: ~/src/github.com/adviser-labs
 tier: auto
 repos:
 - name: turbolapper-mac
