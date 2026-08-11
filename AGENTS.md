@@ -38,6 +38,21 @@ and do NOT travel.
   Brewfile it installs for you.
 - **Ollama**: the Mac app and the brew formula fight over the same port. Pick
   one. `setup.sh` detects an app-provided CLI and skips the formula.
+- **`xcode-select -p` must point at Xcode, not CommandLineTools.** Nothing in
+  this harness needs it, but `/dev-loop` does, and the failure is nasty: a fresh
+  laptop defaults to `/Library/Developer/CommandLineTools`, which ships no
+  `FoundationModelsMacros` plugin, so any cold `swift build` of
+  `turbolapper-fm-mac/engine` dies with
+  `plugin for module 'FoundationModelsMacros' not found` — on code that is
+  perfectly fine. Setting `DEVELOPER_DIR` does **not** fix it (measured); the
+  plugin search path stays unresolved. `./run-app-release.sh` keeps working
+  throughout, because `xcodebuild` supplies its own plugin paths — so it looks
+  like `/dev-loop` failing at random on good code.
+
+  ```sh
+  xcode-select -p                                   # expect /Applications/Xcode.app/...
+  sudo xcode-select -s /Applications/Xcode.app      # if it says CommandLineTools
+  ```
 
 ### Per-machine identity (none of this travels with the repo)
 
@@ -105,6 +120,28 @@ Before wiring local compute into that loop, measure a baseline — `README.md`
 already says baseline before you optimize, and `var/usage.jsonl` is the record
 of what actually gets invoked. As of 2026-08-10 `compress_context` has been
 called **zero** times in the harness's life on any machine.
+
+### Measured 2026-08-10: `/dev-loop` is CPU-bound, not RAM-bound
+
+The obvious way to "use the 128GB laptop" is to run more issues at once. The
+numbers say otherwise. One cold `swift build` of `fm-mac/engine` in a fresh
+worktree — the exact command `issue-pipeline.js` runs:
+
+| | |
+|---|---|
+| Wall clock | ~60s |
+| Peak RSS, whole process tree | ~7.3GB (stable across 3 runs) |
+| System memory delta | ~4GB (the truer marginal cost; RSS double-counts shared pages) |
+| Cores on this machine | 18 (6P + 12E) |
+
+So the RAM ceiling is ~30 concurrent builds, while the CPU ceiling is ~2–4 — a
+single `swift build` already saturates the cores. **Memory is not the scarce
+resource on this machine and never was.**
+
+The cost worth attacking is that every issue pays a full cold rebuild:
+`.build` is gitignored, so each fresh worktree starts from nothing and
+recompiles code byte-identical to what the previous worktree just built. A
+build cache shared across worktrees beats any amount of added concurrency.
 
 ## Working agreements (from sessions so far)
 
