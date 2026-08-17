@@ -1,0 +1,93 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""Run the LiteLLM proxy in the FOREGROUND, with the tier resolved at start.
+
+This exists for launchd. `setup.sh --start` deliberately backgrounds litellm and
+writes var/litellm.pid, which is right for an interactive shell and wrong for a
+process manager: launchd tracks its own child, so a job that forks and exits
+looks like a job that crashed instantly. This script never forks -- it resolves
+the profile, then `execv`s litellm in place, so the pid launchd supervises IS the
+proxy.
+
+Everything else matches start_proxy() in setup.sh on purpose:
+
+* cwd is pinned to the harness root, because the profiles' `disk_cache_dir` is
+  the relative path `var/litellm-cache`. Start from anywhere else and the
+  response cache silently lands somewhere else too.
+* host/port come from config/harness.yaml, so this binds the address that
+  h.chat() and bin/local actually dial.
+* the profile comes from the tier, re-detected on every start when
+  `tier: auto` -- which is what keeps one plist correct on both the 32GB Mac
+  and the 128GB laptop.
+* LITELLM_MASTER_KEY falls back to the same harness default, so the
+  no-secrets path works unattended.
+
+It does NOT write var/litellm.pid. Under launchd the pidfile would be a lie the
+moment launchd restarted the job, and a stale pidfile is exactly the failure
+`AGENTS.md` documents. `launchctl` is the source of truth once the agent is
+installed; see bin/litellm-agent.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+import harness_lib as h  # noqa: E402
+
+
+def resolve_litellm_bin() -> str:
+    """Mirror setup.sh's resolve_litellm_bin, minus the PATH advice.
+
+    launchd hands the job a minimal PATH that does not include ~/.local/bin, so
+    the absolute-path fallback is the normal case here, not the edge case.
+    """
+    found = shutil.which("litellm")
+    if found:
+        return found
+    fallback = Path.home() / ".local" / "bin" / "litellm"
+    if fallback.is_file() and os.access(fallback, os.X_OK):
+        return str(fallback)
+    sys.exit(
+        "litellm not found on PATH or at ~/.local/bin/litellm. "
+        "Run ./setup.sh to install it, then retry."
+    )
+
+
+def main() -> None:
+    cfg = h.load_config()
+    profile = cfg.profile_path
+    if not profile.is_file():
+        sys.exit(f"no LiteLLM profile at {profile} (tier {cfg.tier})")
+
+    os.environ.setdefault("LITELLM_MASTER_KEY", h.DEFAULT_MASTER_KEY)
+
+    binary = resolve_litellm_bin()
+    argv = [
+        binary,
+        "--config", str(profile),
+        "--host", cfg.host,
+        "--port", str(cfg.port),
+    ]
+
+    # Unbuffered, so a crash loop shows its reason in the log immediately rather
+    # than dying with the explanation still sitting in a pipe buffer.
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+    print(
+        f"litellm-serve: tier {cfg.tier} profile {profile.name} "
+        f"-> {cfg.host}:{cfg.port}",
+        flush=True,
+    )
+    os.chdir(ROOT)
+    os.execv(binary, argv)  # never returns
+
+
+if __name__ == "__main__":
+    main()

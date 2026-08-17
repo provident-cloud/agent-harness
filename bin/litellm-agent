@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# Install, remove or inspect the LaunchAgent that keeps the LiteLLM proxy up
+# across reboots.
+#
+# Why this exists: the proxy is the one piece of the harness that is a
+# long-lived machine-wide daemon rather than a per-session child process. Claude
+# Code starts the offload/delegate MCP servers itself on every session; nothing
+# starts the proxy. Before this, a reboot left every session failing with
+# connection-refused on :4000 until someone remembered ./setup.sh --restart.
+#
+# MEASURED interaction with setup.sh, 2026-08-17 on the 128GB laptop. All three
+# were tested against a live launchd-managed proxy; none of it is inferred:
+#
+#   ./setup.sh --stop     Safe no-op. There is no pidfile under launchd, and
+#                         setup.sh refuses to kill a proxy it did not start:
+#                         "this script only stops what it started". Proxy
+#                         untouched, same pid afterwards.
+#   ./setup.sh --restart  Does NOT restart anything. It finds the port held by a
+#                         healthy proxy, reports "already running ... not
+#                         starting a second one", and ADOPTS launchd's child pid
+#                         into var/litellm.pid. Harmless, but it means --restart
+#                         is not how you pick up a changed profile any more --
+#                         `bin/litellm-agent restart` is.
+#   ./setup.sh --stop     ...run after that adoption, this one does kill it
+#     (post-adoption)     (exit 143), launchd restarts it within ~2s, and
+#                         setup.sh removes the pidfile on its way out. So the
+#                         fight is real but leaves nothing stale behind, and you
+#                         simply cannot hold the proxy down this way.
+#
+# Upshot: once installed, `bin/litellm-agent` is the control surface. setup.sh is
+# not broken by the agent and needs no changes; it just stops being the thing
+# that decides whether the proxy is running.
+#
+# The agent owns var/litellm.log but deliberately does NOT write var/litellm.pid.
+# Under launchd a pidfile goes stale the moment the job restarts, and a pidfile
+# naming a dead process is the exact trap AGENTS.md documents. `status` below
+# reports one if it finds it, since its only source now is a setup.sh adoption.
+#
+# One surprise worth knowing: the pid launchd supervises is NOT the proxy.
+# bin/litellm-serve runs under a `uv run --script` shebang and uv does not exec,
+# so the tree is launchd -> uv -> litellm. Supervision still works correctly --
+# SIGKILLing the litellm grandchild propagated exit 137 through uv and launchd
+# restarted the job in 3s (measured) -- but `launchctl print` shows uv's pid,
+# while lsof on :4000 shows litellm's.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LABEL="sh.adviser.harness.litellm"
+TEMPLATE="$ROOT/launchd/$LABEL.plist.template"
+TARGET="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+
+C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+ok()   { printf '%sok%s   %s\n'   "$C_OK"   "$C_OFF" "$*"; }
+warn() { printf '%swarn%s %s\n'   "$C_WARN" "$C_OFF" "$*" >&2; }
+die()  { printf '%serr%s  %s\n'   "$C_ERR"  "$C_OFF" "$*" >&2; exit 1; }
+dim()  { printf '%s     %s%s\n'   "$C_DIM"  "$*" "$C_OFF"; }
+
+usage() {
+  cat <<EOF
+usage: bin/litellm-agent <install|uninstall|start|stop|restart|status>
+
+  install    write ~/Library/LaunchAgents/$LABEL.plist and load it
+  uninstall  unload the job and delete the plist
+  start      load the job (starts the proxy now, and at every login)
+  stop       unload the job (proxy stays down until start/reboot)
+  restart    reload the job, picking up a changed profile or plist
+  status     what launchd thinks, plus a live health probe
+
+After install the proxy comes up at login, and this becomes its control surface:
+./setup.sh --stop is a no-op against it, and ./setup.sh --restart only adopts it
+into a pidfile instead of restarting. Use \`restart\` here to pick up a changed
+profile.
+EOF
+}
+
+# launchd gives a job PATH=/usr/bin:/bin:/usr/sbin:/sbin. bin/litellm-serve is a
+# `uv run --script` shebang, so uv's directory has to be on it or the job dies
+# instantly with `env: uv: No such file or directory`. Resolve uv now, at install
+# time, on the machine being installed -- Apple Silicon puts it in
+# /opt/homebrew/bin, Intel in /usr/local/bin, and a uv installed by its own
+# installer lands in ~/.local/bin.
+build_path() {
+  local uv_bin uv_dir
+  uv_bin="$(command -v uv || true)"
+  [ -n "$uv_bin" ] || die "uv is not on PATH. brew install uv, then retry."
+  uv_dir="$(dirname "$uv_bin")"
+  # ~/.local/bin carries litellm itself; keep the standard dirs for git etc.
+  printf '%s:%s:/usr/bin:/bin:/usr/sbin:/sbin' "$uv_dir" "$HOME/.local/bin"
+}
+
+require_template() {
+  [ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"
+}
+
+loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
+
+health() {
+  local host port url
+  host="$(sed -n 's/^  host: *//p' "$ROOT/config/harness.yaml" 2>/dev/null | head -1)"
+  port="$(sed -n 's/^  port: *//p' "$ROOT/config/harness.yaml" 2>/dev/null | head -1)"
+  url="http://${host:-127.0.0.1}:${port:-4000}/health/liveliness"
+  curl -fsS -m 3 "$url" >/dev/null 2>&1
+}
+
+# `launchctl bootout` returns BEFORE the job is gone -- it requests teardown and
+# does not block. Measured consequence: a bootout immediately followed by a
+# bootstrap fails with `Bootstrap failed: 5: Input/output error`, because the old
+# job still holds the label. Worse, the proxy it was serving is still answering
+# for a second or two afterwards, so a naive health probe reports success and the
+# port looks busy to whatever starts next. Every bootout here goes through this.
+wait_unloaded() {
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    if ! loaded && ! port_busy; then return 0; fi
+    sleep 1; i=$((i + 1))
+  done
+  warn "job still present after 30s"
+  return 1
+}
+
+port_busy() {
+  local port
+  port="$(sed -n 's/^  port: *//p' "$ROOT/config/harness.yaml" 2>/dev/null | head -1)"
+  lsof -nP -iTCP:"${port:-4000}" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+wait_healthy() {
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    health && { ok "proxy answering after ${i}s"; return 0; }
+    sleep 1; i=$((i + 1))
+  done
+  warn "proxy did not answer within 40s"
+  dim "log: $ROOT/var/litellm.log"
+  tail -n 15 "$ROOT/var/litellm.log" 2>/dev/null >&2 || true
+  return 1
+}
+
+cmd_install() {
+  require_template
+  local path_value
+  path_value="$(build_path)"
+
+  mkdir -p "$HOME/Library/LaunchAgents" "$ROOT/var"
+
+  # An already-loaded job holds the old plist; boot it out before overwriting so
+  # `install` is genuinely idempotent rather than half-applied.
+  if loaded; then
+    dim "existing job loaded; booting it out first"
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    wait_unloaded || die "could not unload the existing job; try: launchctl bootout $DOMAIN/$LABEL"
+  fi
+
+  sed -e "s|__HARNESS_ROOT__|$ROOT|g" \
+      -e "s|__PATH__|$path_value|g" \
+      "$TEMPLATE" > "$TARGET"
+
+  plutil -lint "$TARGET" >/dev/null || die "generated plist is not valid: $TARGET"
+  ok "wrote $TARGET"
+  dim "PATH=$path_value"
+
+  # A proxy already running from setup.sh holds the port, and the job would
+  # crash-loop against it. Clear it first, then let launchd own the port.
+  if health || port_busy; then
+    dim "a proxy is already up; stopping it so launchd owns the port"
+    "$ROOT/setup.sh" --stop >/dev/null 2>&1 || true
+    local i=0
+    while port_busy && [ "$i" -lt 15 ]; do sleep 1; i=$((i + 1)); done
+    # setup.sh only stops what it started, so a proxy launched by hand survives
+    # this and the new job would crash-loop against a bound port. Say which pid
+    # to kill instead of leaving launchd to retry every 30s forever.
+    if port_busy; then
+      die "$(printf 'port still held by pid %s -- kill it, then re-run install' \
+        "$(lsof -nP -iTCP:4000 -sTCP:LISTEN -t 2>/dev/null | tr '\n' ' ')")"
+    fi
+  fi
+
+  launchctl bootstrap "$DOMAIN" "$TARGET" || die "launchctl bootstrap failed"
+  ok "loaded $LABEL"
+  wait_healthy
+}
+
+cmd_uninstall() {
+  if loaded; then
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    ok "unloaded $LABEL"
+  else
+    dim "job was not loaded"
+  fi
+  if [ -f "$TARGET" ]; then
+    rm -f "$TARGET"
+    ok "removed $TARGET"
+  else
+    dim "no plist at $TARGET"
+  fi
+  dim "the proxy is now manual again: ./setup.sh --start"
+}
+
+cmd_start() {
+  [ -f "$TARGET" ] || die "not installed. run: bin/litellm-agent install"
+  loaded && { dim "already loaded"; } || launchctl bootstrap "$DOMAIN" "$TARGET"
+  ok "loaded $LABEL"
+  wait_healthy
+}
+
+cmd_stop() {
+  loaded || { dim "job is not loaded"; return 0; }
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  wait_unloaded || return 1
+  ok "unloaded $LABEL (stays down until start, or next login)"
+}
+
+cmd_restart() {
+  [ -f "$TARGET" ] || die "not installed. run: bin/litellm-agent install"
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  wait_unloaded || die "old job did not go away; retry in a moment"
+  launchctl bootstrap "$DOMAIN" "$TARGET" || die "launchctl bootstrap failed"
+  ok "reloaded $LABEL"
+  wait_healthy
+}
+
+cmd_status() {
+  printf 'plist      %s\n' "$([ -f "$TARGET" ] && echo "$TARGET" || echo '(not installed)')"
+  if loaded; then
+    local pid last
+    pid="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^	pid = //p' | head -1)"
+    last="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^	last exit code = //p' | head -1)"
+    printf 'launchd    loaded  pid=%s  last exit=%s\n' "${pid:-none}" "${last:-n/a}"
+  else
+    printf 'launchd    not loaded\n'
+  fi
+  if health; then ok "proxy answering /health/liveliness"; else warn "proxy not answering"; fi
+  # Under launchd nothing here writes a pidfile, so one existing means a
+  # ./setup.sh --restart adopted launchd's child. Say so rather than let the next
+  # reader treat it as authoritative.
+  if [ -f "$ROOT/var/litellm.pid" ]; then
+    warn "var/litellm.pid exists ($(cat "$ROOT/var/litellm.pid")); launchd owns the proxy, so it is not authoritative"
+    dim "it comes from ./setup.sh --restart adopting the running proxy; safe to delete"
+  fi
+}
+
+case "${1:-}" in
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_restart ;;
+  status)    cmd_status ;;
+  -h|--help|help|"") usage ;;
+  *) usage; exit 2 ;;
+esac
