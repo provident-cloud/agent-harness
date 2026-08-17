@@ -74,6 +74,7 @@ cp instantiation/workspace-context.md config/workspace-context.md   # --force ov
 bin/sync-workspace
 bin/local index            # 1041 files / 5088 chunks in ~76s
 bin/local health
+bin/litellm-agent install  # LaunchAgent: proxy survives reboots and crashes
 ```
 
 `tier: auto` re-detects, so nothing else changes per machine. On 128GB
@@ -97,9 +98,14 @@ bin/local health
 - **`bin/local health` showing `0.00s`** — the LiteLLM disk cache replayed an
   identical probe. It does not mean the model is fast. Cold `local-big` is ~9s,
   and generation is ~11 tok/s.
-- **Connection refused on port 4000 after a reboot** — the proxy does not
-  survive one and nothing restarts it. `var/litellm.pid` keeps pointing at the
-  dead pid, so the file's existence proves nothing. `./setup.sh --restart`.
+- **Connection refused on port 4000 after a reboot** — nothing restarted the
+  proxy. `bin/litellm-agent install`, once per machine, makes it a LaunchAgent
+  that comes back at login and after a crash. Without the agent it is
+  `./setup.sh --restart`, and note `var/litellm.pid` keeps naming the dead pid,
+  so the file's existence proves nothing. **Once the agent is installed it owns
+  the proxy**: `setup.sh --stop` becomes a no-op and `--restart` only adopts it
+  into a pidfile, so use `bin/litellm-agent restart`. That script's header has
+  the measured details.
 - **Delegation suddenly runs on a local model, or dies with a context error** —
   something copied `codex/config.toml.template` over `~/.codex/config.toml`.
   **Never do that.** The two configs pull in opposite directions: the template
