@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# Run a repo's poll script on an interval, across reboots, via launchd.
+#
+# The contract with the product repo is one sentence:
+#
+#   The harness runs <repo>/<script> every N seconds, in a sane environment,
+#   and reports its exit code.
+#
+# Everything policy-shaped stays on the repo side of that sentence. This file
+# never learns which issues matter, who files them, or what to do with them --
+# per AGENTS.md, team-specific policy has no place in a public core. The
+# launchd machinery is the generic half, and it is generic because it was
+# already paid for once in bin/litellm-agent.
+#
+# MEASURED TRAPS (2026-08-17, on the 128GB laptop). Each of these cost real time
+# to find, and each is enforced below rather than merely documented:
+#
+#   1. `USER` missing from the job environment makes `claude -p` return
+#      {"is_error":true,"result":"Not logged in · Please run /login",
+#       "total_cost_usd":0}
+#      -- a zero-cost, zero-output failure indistinguishable from "nothing to
+#      do". HOME alone does not fix it. Every tick would look fine, forever.
+#      `install` probes for this before writing anything, which is the single
+#      most valuable check in this file: it converts a month of silent no-ops
+#      into one loud failure at install time.
+#
+#   2. `command -v claude` can resolve to a session-scoped shim under $TMPDIR
+#      (e.g. /var/folders/.../cmux-cli-shims/<uuid>/claude, mode 0700). That
+#      path will not exist when launchd runs. Same shape as the `uv` PATH trap
+#      in bin/litellm-agent, wearing a different costume -- so resolve the real
+#      binary and refuse a temp-dir one.
+#
+#   3. `launchctl bootout` is asynchronous: it returns before the label is free,
+#      so bootout-then-bootstrap fails with `Bootstrap failed: 5: Input/output
+#      error`. Every bootout here waits.
+#
+#   4. macOS has no `flock(1)` and no `timeout(1)`. Overlap protection is
+#      `/usr/bin/lockf`, and any run watchdog has to be hand-rolled. That is the
+#      poll script's problem, not this file's, but it is recorded here because it
+#      is the same class of surprise.
+#
+# launchd is the registry: `list` globs the installed plists. There is no extra
+# config file to drift out of sync with reality.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEMPLATE="$ROOT/launchd/sh.adviser.harness.watch.plist.template"
+LABEL_PREFIX="sh.adviser.harness.watch"
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+DOMAIN="gui/$(id -u)"
+
+C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+ok()   { printf '%sok%s   %s\n' "$C_OK"   "$C_OFF" "$*"; }
+warn() { printf '%swarn%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+die()  { printf '%serr%s  %s\n' "$C_ERR"  "$C_OFF" "$*" >&2; exit 1; }
+dim()  { printf '%s     %s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+
+usage() {
+  cat <<EOF
+usage: bin/issue-watch <command> [options]
+
+  install --repo <path> [--script .claude/dev-loop/poll] [--interval 1800]
+  uninstall (--repo <path> | --name <watch>)
+  start|stop|restart --name <watch>
+  status [--name <watch>]     launchd state, last exit, recent ticks, staleness
+  list                        every installed watch
+  logs --name <watch> [-n 40] tail that watch's tick log
+  run --repo <path>           run the poll script once, in the foreground, now
+
+The watch name defaults to the repo directory name. Install refuses rather than
+writing a job that would fail every tick: it probes gh auth and claude auth in a
+launchd-shaped environment first.
+EOF
+}
+
+# --- binary resolution -------------------------------------------------------
+
+# `command -v claude` IS WRONG HERE (trap 2). Prefer the real install path, and
+# reject anything under a temp dir even if that is all we can find -- a job
+# pointing at a dead shim is worse than a refused install.
+resolve_claude() {
+  local c=""
+  [ -x "$HOME/.local/bin/claude" ] && c="$HOME/.local/bin/claude"
+  [ -n "$c" ] || c="$(command -v claude 2>/dev/null || true)"
+  [ -n "$c" ] || die "claude is not installed (looked in ~/.local/bin and on PATH)."
+  case "$c" in
+    /var/folders/*|/private/var/folders/*|/tmp/*|"${TMPDIR%/}"/*)
+      die "resolved claude to a session-scoped shim: $c
+     That path dies with the terminal session, so launchd would never find it.
+     Install the real CLI and re-run, or symlink it into ~/.local/bin/claude." ;;
+  esac
+  printf '%s' "$c"
+}
+
+build_path() {
+  local gh_d uv_d claude_d
+  command -v gh >/dev/null 2>&1 || die "gh is not on PATH. brew install gh, then retry."
+  command -v uv >/dev/null 2>&1 || die "uv is not on PATH. brew install uv, then retry."
+  gh_d="$(cd "$(dirname "$(command -v gh)")" && pwd)"
+  uv_d="$(cd "$(dirname "$(command -v uv)")" && pwd)"
+  claude_d="$(cd "$(dirname "$(resolve_claude)")" && pwd)"
+  # uv is on here because the workspace .mcp.json spawns the offload/delegate
+  # servers with a bare `uv` command. Drop it and the local model tools silently
+  # disappear from every unattended run.
+  printf '%s:%s:%s:%s:/usr/bin:/bin:/usr/sbin:/sbin' \
+    "$gh_d" "$claude_d" "$uv_d" "$HOME/.local/bin"
+}
+
+# --- launchd helpers ---------------------------------------------------------
+
+label_for() { printf '%s.%s' "$LABEL_PREFIX" "$1"; }
+plist_for() { printf '%s/%s.%s.plist' "$AGENTS_DIR" "$LABEL_PREFIX" "$1"; }
+loaded()    { launchctl print "$DOMAIN/$(label_for "$1")" >/dev/null 2>&1; }
+
+# Trap 3: bootout returns before the job is gone.
+wait_unloaded() {
+  local name="$1" i=0
+  while [ "$i" -lt 30 ]; do
+    loaded "$name" || return 0
+    sleep 1; i=$((i + 1))
+  done
+  warn "job $(label_for "$name") still present after 30s"
+  return 1
+}
+
+# --- install -----------------------------------------------------------------
+
+# The probes. Both run in `env -i` with exactly the variables the plist will
+# provide, so a pass here means a pass under launchd -- and a failure here is
+# the loud version of trap 1.
+probe_env() {
+  local path_value="$1"; shift
+  env -i PATH="$path_value" HOME="$HOME" USER="$(id -un)" TMPDIR="${TMPDIR:-/tmp}" \
+    LANG=en_US.UTF-8 "$@"
+}
+
+cmd_install() {
+  local repo="" script=".claude/dev-loop/poll" interval=1800 name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --script) script="$2"; shift 2 ;;
+      --interval) interval="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [ -n "$repo" ] || die "--repo is required"
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || die "no such directory: $repo"
+  [ -n "$name" ] || name="$(basename "$repo")"
+  [ -x "$repo/$script" ] || die "not executable: $repo/$script
+     That file is the whole contract. Create it and chmod +x, then retry."
+  [ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"
+  case "$interval" in ''|*[!0-9]*) die "--interval must be seconds" ;; esac
+  [ "$interval" -ge 300 ] || die "--interval below 300s; ThrottleInterval would drop fires anyway"
+
+  local path_value; path_value="$(build_path)"
+
+  # Probe 1: gh, in a launchd-shaped env. Proves the keychain is reachable.
+  probe_env "$path_value" gh auth status >/dev/null 2>&1 \
+    || die "gh is not authenticated in a launchd-shaped environment. Run: gh auth login"
+  ok "gh authenticates under a launchd-shaped environment"
+
+  # Probe 2: THE important one (trap 1). A missing USER here is a $0 is_error
+  # no-op that looks exactly like success, so catch it now, once, loudly.
+  local probe out
+  probe="$(probe_env "$path_value" claude -p "Reply with exactly: PROBE-OK" --output-format json 2>&1 || true)"
+  out="$(printf '%s' "$probe" | /usr/bin/python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print(("ERR:" if d.get("is_error") else "OK:")+str(d.get("result"))[:120])
+except Exception: print("ERR:unparseable output")' 2>/dev/null || echo "ERR:probe failed")"
+  case "$out" in
+    OK:*) ok "claude authenticates under a launchd-shaped environment" ;;
+    *"Not logged in"*)
+      die "claude reports 'Not logged in' in a launchd-shaped environment.
+     This is the USER trap -- see this script's header. If USER is present and it
+     still fails, run \`claude\` once interactively to refresh credentials." ;;
+    *) die "claude probe failed: ${out#ERR:}" ;;
+  esac
+
+  mkdir -p "$AGENTS_DIR" "$repo/.claude/dev-loop/log"
+
+  local target; target="$(plist_for "$name")"
+  if loaded "$name"; then
+    dim "existing watch loaded; booting it out first"
+    launchctl bootout "$DOMAIN/$(label_for "$name")" 2>/dev/null || true
+    wait_unloaded "$name" || die "could not unload $(label_for "$name")"
+  fi
+
+  sed -e "s|__WATCH_NAME__|$name|g" \
+      -e "s|__REPO_ROOT__|$repo|g" \
+      -e "s|__POLL_SCRIPT__|$script|g" \
+      -e "s|__PATH__|$path_value|g" \
+      -e "s|__USER__|$(id -un)|g" \
+      -e "s|__HOME__|$HOME|g" \
+      -e "s|__TMPDIR__|${TMPDIR:-/tmp}|g" \
+      -e "s|__INTERVAL__|$interval|g" \
+      "$TEMPLATE" > "$target"
+  plutil -lint "$target" >/dev/null || die "generated plist is invalid: $target"
+  ok "wrote $target"
+  dim "interval ${interval}s  script $script"
+
+  # launchd holds the log fd and never rotates it, so truncate once now, while
+  # nothing has it open. The script's own watch.log is the one it can prune.
+  : > "$repo/.claude/dev-loop/log/launchd.log" 2>/dev/null || true
+
+  launchctl bootstrap "$DOMAIN" "$target" || die "launchctl bootstrap failed"
+  ok "loaded $(label_for "$name")"
+  dim "RunAtLoad fires one tick now; watch it with: bin/issue-watch logs --name $name"
+}
+
+# --- the rest ----------------------------------------------------------------
+
+cmd_uninstall() {
+  local name="" repo=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --repo) repo="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [ -n "$name" ] || { [ -n "$repo" ] || die "--name or --repo is required"; name="$(basename "$(cd "$repo" && pwd)")"; }
+  if loaded "$name"; then
+    launchctl bootout "$DOMAIN/$(label_for "$name")" 2>/dev/null || true
+    wait_unloaded "$name" || true
+    ok "unloaded $(label_for "$name")"
+  else
+    dim "not loaded"
+  fi
+  local target; target="$(plist_for "$name")"
+  [ -f "$target" ] && { rm -f "$target"; ok "removed $target"; } || dim "no plist at $target"
+}
+
+cmd_start()   { local n="$1"; [ -f "$(plist_for "$n")" ] || die "not installed: $n"; loaded "$n" && dim "already loaded" || launchctl bootstrap "$DOMAIN" "$(plist_for "$n")"; ok "loaded $(label_for "$n")"; }
+cmd_stop()    { local n="$1"; loaded "$n" || { dim "not loaded"; return 0; }; launchctl bootout "$DOMAIN/$(label_for "$n")" 2>/dev/null || true; wait_unloaded "$n" || true; ok "unloaded $(label_for "$n")"; }
+cmd_restart() { local n="$1"; [ -f "$(plist_for "$n")" ] || die "not installed: $n"; cmd_stop "$n" >/dev/null 2>&1 || true; launchctl bootstrap "$DOMAIN" "$(plist_for "$n")" || die "bootstrap failed"; ok "reloaded $(label_for "$n")"; }
+
+cmd_list() {
+  local found=0 f name
+  for f in "$AGENTS_DIR/$LABEL_PREFIX".*.plist; do
+    [ -f "$f" ] || continue
+    found=1
+    name="$(basename "$f")"; name="${name#"$LABEL_PREFIX".}"; name="${name%.plist}"
+    printf '  %-28s %s\n' "$name" "$(loaded "$name" && echo loaded || echo 'not loaded')"
+  done
+  [ "$found" = 1 ] || dim "no watches installed"
+}
+
+repo_of() {
+  local n="$1" f; f="$(plist_for "$n")"
+  [ -f "$f" ] || return 1
+  /usr/bin/plutil -extract WorkingDirectory raw -o - "$f" 2>/dev/null
+}
+
+cmd_status() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then cmd_list; return 0; fi
+  local target repo interval
+  target="$(plist_for "$name")"
+  printf 'plist      %s\n' "$([ -f "$target" ] && echo "$target" || echo '(not installed)')"
+  [ -f "$target" ] || return 0
+  repo="$(repo_of "$name" || true)"
+  interval="$(/usr/bin/plutil -extract StartInterval raw -o - "$target" 2>/dev/null || echo '?')"
+  if loaded "$name"; then
+    local pid last
+    pid="$(launchctl print "$DOMAIN/$(label_for "$name")" 2>/dev/null | sed -n 's/^	pid = //p' | head -1)"
+    last="$(launchctl print "$DOMAIN/$(label_for "$name")" 2>/dev/null | sed -n 's/^	last exit code = //p' | head -1)"
+    printf 'launchd    loaded  pid=%s  last exit=%s\n' "${pid:-none}" "${last:-n/a}"
+  else
+    printf 'launchd    not loaded\n'
+  fi
+  printf 'interval   %ss\nrepo       %s\n' "$interval" "${repo:-?}"
+  local logf="$repo/.claude/dev-loop/log/watch.log"
+  if [ -f "$logf" ]; then
+    local newest age
+    newest="$(/usr/bin/stat -f %m "$logf" 2>/dev/null || echo 0)"
+    age=$(( $(date +%s) - newest ))
+    printf 'last tick  %ss ago\n' "$age"
+    # The dead-man's switch. This is the ONE failure that leaves no log line at
+    # all -- launchd simply never fired -- so nothing else catches it.
+    if [ "$interval" != '?' ] && [ "$age" -gt $(( interval * 2 )) ]; then
+      warn "last tick is older than 2x the interval — launchd may not be firing"
+    fi
+    printf 'recent\n'; tail -n 6 "$logf" | sed 's/^/  /'
+  else
+    dim "no tick log yet at $logf"
+  fi
+  [ -e "$repo/.claude/dev-loop/pause" ] && warn "PAUSED — remove $repo/.claude/dev-loop/pause to resume"
+  return 0
+}
+
+cmd_logs() {
+  local name="$1" n="${2:-40}" repo
+  repo="$(repo_of "$name")" || die "not installed: $name"
+  tail -n "$n" "$repo/.claude/dev-loop/log/watch.log" 2>/dev/null || dim "no log yet"
+}
+
+cmd_run() {
+  local repo="$1" script="${2:-.claude/dev-loop/poll}"
+  repo="$(cd "$repo" && pwd)" || die "no such directory"
+  [ -x "$repo/$script" ] || die "not executable: $repo/$script"
+  dim "running $script in the foreground with a launchd-shaped environment"
+  probe_env "$(build_path)" DEVLOOP_REPO="$repo" "$repo/$script"
+}
+
+case "${1:-}" in
+  install)   shift; cmd_install "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  start)     shift; [ "${1:-}" = --name ] && shift; cmd_start "${1:?--name required}" ;;
+  stop)      shift; [ "${1:-}" = --name ] && shift; cmd_stop "${1:?--name required}" ;;
+  restart)   shift; [ "${1:-}" = --name ] && shift; cmd_restart "${1:?--name required}" ;;
+  status)    shift; [ "${1:-}" = --name ] && shift; cmd_status "${1:-}" ;;
+  list)      cmd_list ;;
+  logs)      shift; [ "${1:-}" = --name ] && shift; name="${1:?--name required}"; shift || true; [ "${1:-}" = -n ] && shift; cmd_logs "$name" "${1:-40}" ;;
+  run)       shift; [ "${1:-}" = --repo ] && shift; cmd_run "${1:?--repo required}" ;;
+  -h|--help|help|"") usage ;;
+  *) usage; exit 2 ;;
+esac
