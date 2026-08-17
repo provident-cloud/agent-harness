@@ -119,48 +119,17 @@ bin/local health
 
 ## Harness vs `/dev-loop`
 
-Two layers, deliberately separate:
+Two layers, deliberately separate, with **zero** integration today. This harness
+is the capability layer: local aliases, the `offload`/`delegate` MCP servers, the
+cross-repo index. **`/dev-loop`** is the policy layer and lives *inside* the
+product repos (`.claude/skills/dev-loop/`,
+`.claude/workflows/issue-pipeline.js`), encoding turbolapper specifics —
+`bb-adviser`'s issues, the single-merger rule, round branches — that have no
+place in a public core.
 
-- **This harness** is the capability layer — local models behind
-  `local-big`/`local-fast`/`local-embed`, the `offload` and `delegate` MCP
-  servers, and the cross-repo semantic index. Repo-agnostic; the generic parts
-  should eventually flow upstream to a public template.
-- **`/dev-loop`** is the policy layer, and lives *inside* the product repos
-  (`.claude/skills/dev-loop/`, `.claude/workflows/issue-pipeline.js`). It encodes
-  turbolapper specifics: `bb-adviser`'s issues, the single-merger rule, round
-  branches. It has no place in a public core.
-
-They currently have **zero** integration. Note the two pipelines have diverged:
-`turbolapper-fm-mac` has a `Merge` phase that squash-merges into a `round/…`
-branch; `turbolapper-mac` still stops at a PR. "Agents never merge" is true of
-**`main` only**. Any change is a port between the repos, never a copy.
-
-Before wiring local compute into that loop, measure a baseline — `README.md`
-already says baseline before you optimize, and `var/usage.jsonl` is the record
-of what actually gets invoked. As of 2026-08-10 `compress_context` has been
-called **zero** times in the harness's life on any machine.
-
-### Measured 2026-08-10: `/dev-loop` is CPU-bound, not RAM-bound
-
-The obvious way to "use the 128GB laptop" is to run more issues at once. The
-numbers say otherwise. One cold `swift build` of `fm-mac/engine` in a fresh
-worktree — the exact command `issue-pipeline.js` runs:
-
-| | |
-|---|---|
-| Wall clock | ~60s |
-| Peak RSS, whole process tree | ~7.3GB (stable across 3 runs) |
-| System memory delta | ~4GB (the truer marginal cost; RSS double-counts shared pages) |
-| Cores on this machine | 18 (6P + 12E) |
-
-So the RAM ceiling is ~30 concurrent builds, while the CPU ceiling is ~2–4 — a
-single `swift build` already saturates the cores. **Memory is not the scarce
-resource on this machine and never was.**
-
-The cost worth attacking is that every issue pays a full cold rebuild:
-`.build` is gitignored, so each fresh worktree starts from nothing and
-recompiles code byte-identical to what the previous worktree just built. A
-build cache shared across worktrees beats any amount of added concurrency.
+`/dev-loop` is CPU-bound, not RAM-bound, and the two product pipelines have
+diverged. Both are measured in **`docs/dev-loop-baseline.md`**; read it before
+adding concurrency there or wiring local compute in.
 
 ## Working agreements (from sessions so far)
 
