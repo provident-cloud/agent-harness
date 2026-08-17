@@ -97,6 +97,25 @@ bin/local health
 - **`bin/local health` showing `0.00s`** — the LiteLLM disk cache replayed an
   identical probe. It does not mean the model is fast. Cold `local-big` is ~9s,
   and generation is ~11 tok/s.
+- **Connection refused on port 4000 after a reboot** — the proxy does not
+  survive one and nothing restarts it. `var/litellm.pid` keeps pointing at the
+  dead pid, so the file's existence proves nothing. `./setup.sh --restart`.
+- **Delegation suddenly runs on a local model, or dies with a context error** —
+  something copied `codex/config.toml.template` over `~/.codex/config.toml`.
+  **Never do that.** The two configs pull in opposite directions: the template
+  points Codex CLI *at this harness's local proxy*, while `delegate` is the
+  frontier rung by definition and rejects harness aliases outright
+  (`mcp/delegate-server/server.py`). For delegation, `~/.codex/config.toml`
+  wants nothing from that template — trust entries and a `codex login` are the
+  whole requirement. Only use the template if you separately want to drive
+  Codex itself off local models, and then merge the blocks rather than
+  overwrite. Note the template's own header does not warn about this conflict.
+- **`bin/sync-workspace` fails to clone with "Repository not found"** — check
+  the org spelling before the SSH alias. It is `adviserlabs`, no hyphen. The
+  directory these repos live in is `.../github.com/adviser-labs/`, which is a
+  local path convention only; the hyphenated org does not exist on GitHub, and
+  this harness's own remote is `provident-cloud/agent-harness`. A stale clone
+  can carry a dead remote indefinitely, because git only resolves it on fetch.
 
 ## Harness vs `/dev-loop`
 

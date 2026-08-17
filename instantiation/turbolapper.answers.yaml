@@ -18,6 +18,15 @@ repos:
   branch: main
   description: Apple Foundation Models edition -- streamlined on-device report builder,
     forked from the superset.
+# Scaffold only as of 2026-08-16 -- 14 placeholder READMEs, no code. Listed so it
+# is cloned and indexed the moment code lands. The org is `adviserlabs`, no
+# hyphen; a local clone here carried a dead `adviser-labs` remote for days
+# because that org does not exist and nothing checks a remote until it is used.
+- name: turbolapper-apple
+  remote: git@github-personal:adviserlabs/turbolapper-apple.git
+  branch: main
+  description: Non-AFM Apple app variant -- same Apple shell driven by open models
+    (Qwen, Kimi, Gemma) instead of Apple Foundation Models.
 oss:
   enabled: false
   base_url: https://models.mixlayer.ai/v1
