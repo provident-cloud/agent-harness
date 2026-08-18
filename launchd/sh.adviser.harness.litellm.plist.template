@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for the harness LiteLLM proxy. Installed by bin/litellm-agent,
+  which substitutes __HARNESS_ROOT__ and __PATH__ at install time. Do not copy
+  this file into ~/Library/LaunchAgents by hand -- the placeholders are not
+  optional, and __PATH__ in particular is machine-specific.
+
+  Why __PATH__ is generated rather than hardcoded: launchd hands a job a minimal
+  PATH (/usr/bin:/bin:/usr/sbin:/sbin). bin/litellm-serve is a `uv run --script`
+  shebang, so without uv's directory on PATH the job dies instantly with
+  `env: uv: No such file or directory` -- measured, not hypothesised. uv lives in
+  /opt/homebrew/bin on Apple Silicon and /usr/local/bin on Intel, so the
+  installer resolves it and bakes the real directory in.
+
+  A custom LITELLM_MASTER_KEY is NOT baked in. The harness default
+  (sk-harness-local) is applied by bin/litellm-serve, which is what makes the
+  no-secrets path work unattended. If you set a non-default key in .envrc, add it
+  to EnvironmentVariables below by hand -- and note that puts the key in a
+  plaintext file outside the repo.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sh.adviser.harness.litellm</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HARNESS_ROOT__/bin/litellm-serve</string>
+  </array>
+
+  <!-- The profiles' disk_cache_dir is the relative path var/litellm-cache, so
+       cwd decides where the response cache lands. bin/litellm-serve chdirs too;
+       this is the belt to that braces. -->
+  <key>WorkingDirectory</key>
+  <string>__HARNESS_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>HARNESS_ROOT</key>
+    <string>__HARNESS_ROOT__</string>
+  </dict>
+
+  <!-- Same log setup.sh writes, so the `If it breaks` advice in AGENTS.md still
+       points at the right file no matter which one started the proxy. -->
+  <key>StandardOutPath</key>
+  <string>__HARNESS_ROOT__/var/litellm.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HARNESS_ROOT__/var/litellm.log</string>
+
+  <!-- The actual requirement: survive a reboot. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart if it dies unexpectedly, but stay down after a clean exit, so
+       `launchctl kill -TERM` and `bin/litellm-agent stop` are not fought.
+       See bin/litellm-agent's docstring for the measured interaction with
+       ./setup.sh --stop. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- Don't hammer on a config error: 30s between restarts while it is broken. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+</dict>
+</plist>
