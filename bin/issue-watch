@@ -301,7 +301,11 @@ cmd_run() {
   repo="$(cd "$repo" && pwd)" || die "no such directory"
   [ -x "$repo/$script" ] || die "not executable: $repo/$script"
   dim "running $script in the foreground with a launchd-shaped environment"
-  probe_env "$(build_path)" DEVLOOP_REPO="$repo" "$repo/$script"
+  # cd first: the plist sets WorkingDirectory, and a foreground run has to match
+  # it or the two paths differ in the one way that matters. Measured: without
+  # this, claude started in the harness checkout and the tick died on
+  # `Unknown command: /dev-loop`, because the skill lives in the product repo.
+  (cd "$repo" && probe_env "$(build_path)" DEVLOOP_REPO="$repo" "$repo/$script")
 }
 
 case "${1:-}" in
