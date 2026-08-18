@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Generic issue-watch LaunchAgent: run one repo's poll script on an interval.
+  Installed by bin/issue-watch, which substitutes every __PLACEHOLDER__ at
+  install time. Do not copy this by hand — the placeholders are not optional
+  and several are machine-specific.
+
+  The harness knows exactly one thing about the repo: run __POLL_SCRIPT__ every
+  __INTERVAL__ seconds, in a sane environment, and log the exit code. Everything
+  about WHICH issues matter, who filed them, and what to do with them lives in
+  that script, inside the product repo. That seam is deliberate: per AGENTS.md,
+  team-specific policy has no place in a public core.
+
+  __USER__ IS NOT OPTIONAL, and this is the trap that cost the most to find.
+  Measured 2026-08-17: `claude -p` in an environment with no USER returns
+    {"is_error": true, "result": "Not logged in · Please run /login",
+     "total_cost_usd": 0}
+  A zero-cost, zero-output failure that is indistinguishable from "there was
+  nothing to do". Every tick would appear to succeed, forever. HOME alone is not
+  enough — verified by bisection.
+
+  __PATH__ is generated, never hardcoded. launchd hands a job
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin and nothing more, and three binaries have
+  to be reachable on it:
+    * gh     — /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel
+    * claude — ~/.local/bin/claude. NOTE: `command -v claude` can resolve to a
+               session-scoped shim under $TMPDIR that will not exist when
+               launchd runs; bin/issue-watch rejects those paths.
+    * uv     — because the workspace .mcp.json declares `"command": "uv"` bare.
+               Without uv the offload MCP server never starts, and the local
+               model tools vanish from the run with no error.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sh.adviser.harness.watch.__WATCH_NAME__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO_ROOT__/__POLL_SCRIPT__</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <!-- See the header. Removing USER makes every tick a silent $0 no-op. -->
+    <key>USER</key>
+    <string>__USER__</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>TMPDIR</key>
+    <string>__TMPDIR__</string>
+    <key>LANG</key>
+    <string>en_US.UTF-8</string>
+    <key>DEVLOOP_REPO</key>
+    <string>__REPO_ROOT__</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__REPO_ROOT__/.claude/dev-loop/log/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO_ROOT__/.claude/dev-loop/log/launchd.log</string>
+
+  <!-- Periodic, not a daemon. A fixed period is what "check every so often"
+       means; StartCalendarInterval would buy wall-clock pinning that nothing
+       here needs. Both drop fires while the machine sleeps and run once after
+       wake, which is what we want: catch up on issues filed overnight. -->
+  <key>StartInterval</key>
+  <integer>__INTERVAL__</integer>
+
+  <!-- KeepAlive is ABSENT ON PURPOSE — the opposite call from the litellm
+       agent, and for a reason. The proxy is a daemon whose correct state is
+       "running", so a crash must be restarted. This is a periodic job whose
+       correct state is "exited". KeepAlive here would relaunch on every
+       non-zero exit, floored only by ThrottleInterval: a crash loop that spawns
+       billed `claude -p` runs as fast as launchd permits. With it absent,
+       StartInterval alone governs and a failed tick simply waits for the next. -->
+
+  <!-- Catch up shortly after login/reboot rather than waiting out a full
+       interval. The poll script is cheap and exits when there is nothing to do. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- A hard floor on spawn frequency: no combination of settings or manual
+       kickstarts can bill more than one run per five minutes. -->
+  <key>ThrottleInterval</key>
+  <integer>300</integer>
+
+  <!-- ProcessType is deliberately UNSET (= Standard). "Background" applies the
+       Darwin background classification, which throttles CPU and I/O and is
+       INHERITED BY CHILD PROCESSES — the ~60s cold `swift build` this job's
+       grandchildren run would stretch into minutes. -->
+</dict>
+</plist>

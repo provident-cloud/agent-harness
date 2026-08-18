@@ -125,13 +125,31 @@ bin/litellm-agent install  # LaunchAgent: proxy survives reboots and crashes
 
 ## Harness vs `/dev-loop`
 
-Two layers, deliberately separate, with **zero** integration today. This harness
-is the capability layer: local aliases, the `offload`/`delegate` MCP servers, the
-cross-repo index. **`/dev-loop`** is the policy layer and lives *inside* the
-product repos (`.claude/skills/dev-loop/`,
-`.claude/workflows/issue-pipeline.js`), encoding turbolapper specifics —
-`bb-adviser`'s issues, the single-merger rule, round branches — that have no
-place in a public core.
+Two layers, deliberately separate. This harness is the capability layer: local
+aliases, the `offload`/`delegate` MCP servers, the cross-repo index.
+**`/dev-loop`** is the policy layer and lives *inside* the product repos
+(`.claude/skills/dev-loop/`, `.claude/workflows/issue-pipeline.js`), encoding
+turbolapper specifics — `bb-adviser`'s issues, the single-merger rule, round
+branches — that have no place in a public core.
+
+They used to have zero integration. They now meet at exactly one seam, and it is
+deliberately one sentence wide:
+
+> `bin/issue-watch` runs `<repo>/<script>` every N seconds, in a sane
+> environment, and reports its exit code.
+
+The harness supplies the schedule and a working environment; the repo supplies
+every judgement about which issues matter and what to do with them. Nothing about
+`bb-adviser`, labels, or merge policy crosses into this repo — which is what
+keeps the generic half generic. `bin/issue-watch install --repo <path>`, once per
+machine; `status` and `logs` from here, everything else in the product repo.
+
+Two traps it enforces at install time rather than documenting, because both fail
+silently: a job environment with no `USER` makes `claude -p` answer
+`{"is_error":true,"result":"Not logged in","total_cost_usd":0}` — a $0 no-op
+indistinguishable from "nothing to do" — and `command -v claude` can resolve to a
+`$TMPDIR` shim that will not exist when launchd runs. `install` probes for both
+and refuses rather than writing a job that fails every tick.
 
 `/dev-loop` is CPU-bound, not RAM-bound, and the two product pipelines have
 diverged. Both are measured in **`docs/dev-loop-baseline.md`**; read it before
