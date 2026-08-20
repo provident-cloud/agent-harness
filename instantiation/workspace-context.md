@@ -30,6 +30,31 @@ dependency between them** — code moves by porting, not by import. That means:
   `product-specs/HANDOFF.md` is the front door; mockups are the source of truth
   for feel).
 
+## Which session, which skill
+
+**Claude Code resolves skills, commands and `.mcp.json` from the session's own
+project root.** It does not look into subdirectories. So the harness commands and
+a repo's own skills never appear together by default — **cwd is the switch**, and
+it is not configurable.
+
+| Session opened at | Has |
+|---|---|
+| **this workspace root** | `/delegate`, `/fix-issue`, `/harness-init`, `/review-pr`; the `offload` + `delegate` MCP tools |
+| **a product repo root** | that repo's `.claude/skills/`: `/build-out`, `/dev-loop`, `/release`, `/ship-testflight`, `/setup-release-secrets`. `turbolapper-fm-mac` also carries its own `.mcp.json`, so the offload tools come along; `turbolapper-mac` does not yet (candidate port) |
+
+Rule of thumb: **cross-repo work → the workspace root. Building or shipping one
+repo → that repo's root.** To run `/build-out`, open Claude Code *in the repo* and
+state the merge scope in your own words — the skill's §0 gate will not merge
+without it, and no flag grants it.
+
+Both repos define the **same five skill names**, already diverged. Which repo you
+opened decides which policy you get; that is load-bearing, not cosmetic.
+
+Unattended, `agent-harness/bin/issue-watch` runs a repo's own poll script on a
+launchd interval (it `cd`s into the repo first — otherwise the tick dies on
+`Unknown command: /dev-loop`). `/build-out` is excluded from that path on purpose:
+it merges, and it takes its scope from a human who is present.
+
 ## Build & test (details in each repo's CLAUDE.md — read it before building)
 
 - Engine: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer sh -c 'cd engine && swift build && swift test'`
