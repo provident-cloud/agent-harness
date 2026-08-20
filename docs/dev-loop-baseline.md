@@ -7,8 +7,14 @@ measurement below refutes the obvious plan.
 `/dev-loop` is the policy layer: it lives *inside* the product repos
 (`.claude/skills/dev-loop/`, `.claude/workflows/issue-pipeline.js`) and encodes
 turbolapper specifics — `bb-adviser`'s issues, the single-merger rule, round
-branches. This harness is the capability layer. The two have **zero**
-integration today.
+branches. This harness is the capability layer.
+
+The two meet at exactly two seams, and nowhere else. `bin/issue-watch` runs the
+repo's poll script on an interval and reports its exit code — the harness never
+learns which issues matter. And as of 2026-08-19 `turbolapper-fm-mac` carries its
+own `.mcp.json` pointing at `$HARNESS_ROOT` (falling back to `../agent-harness`),
+so a session opened at that repo's root keeps the offload tools instead of losing
+them. Capability flows in; **every merge decision stays on the repo side.**
 
 ## The two pipelines have diverged
 
