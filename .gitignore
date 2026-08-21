@@ -2,7 +2,11 @@
 # It stays out of this public template by default. A private fork that tracks this
 # repo as upstream may well want it committed -- that is the intended way to share a
 # harness with a team. To do that, add `!config/` below this line (or delete the rule).
+#
+# The rule is path-agnostic, so it also swallowed examples/acme/config/ -- which is
+# committed worked-example content, not generated state. Hence the negation.
 config/
+!examples/acme/config/
 
 # Runtime state: logs, PID file, the usage journal.
 var/
