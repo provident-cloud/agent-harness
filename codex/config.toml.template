@@ -4,8 +4,16 @@
 #   mkdir -p ~/.codex
 #   cp codex/config.toml.template ~/.codex/config.toml
 #
-# If you already have a ~/.codex/config.toml, merge the [model_providers.harness]
-# and [profiles.*] blocks into it instead of overwriting the file.
+# WARNING: only do that copy if you separately want to drive Codex CLI itself off
+# local models. It BREAKS frontier delegation. The `delegate` MCP server is the
+# frontier rung by definition and rejects harness aliases outright, so a
+# ~/.codex/config.toml pointed at this proxy makes `/delegate` either run on a
+# local model or die with a context error. Delegation wants nothing from this
+# file -- trust entries plus `codex login` are its whole requirement.
+#
+# If you already have a ~/.codex/config.toml -- and you do, if you use delegation
+# -- merge the [model_providers.harness] and [profiles.*] blocks into it under a
+# named profile instead of overwriting the file.
 #
 # Requires the proxy to be running: ./setup.sh --start
 #

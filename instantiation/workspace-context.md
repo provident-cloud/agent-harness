@@ -2,11 +2,14 @@
      style). Hand-edited copies are never replaced without --force. Edit freely. -->
 # TurboLapper workspace
 
-Loaded into every agent session started in the workspace root (`workspace_root` in
-`instantiation/turbolapper.answers.yaml`, by default `~/Documents/repos`)
-(`CLAUDE.md` and `AGENTS.md` there are symlinks to this file). Two macOS apps for
-on-device data analysis, one fork relationship. Other sibling directories under this
-workspace root are unrelated projects — ignore them.
+Loaded into every agent session started in the workspace root — `workspace_root` in
+`agent-harness/config/harness.yaml`, which is the authority; currently
+`~/src/github.com/adviser-labs`. (`CLAUDE.md` and `AGENTS.md` there are symlinks to
+this file.) If that path and the tree you actually open ever disagree, the index
+silently describes the wrong code — check before trusting a search result.
+
+Two macOS apps for on-device data analysis, one fork relationship. Other sibling
+directories under this workspace root are unrelated projects — ignore them.
 
 | Repo | What it is |
 |---|---|
