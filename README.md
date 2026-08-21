@@ -49,6 +49,10 @@ Then open Claude Code at the **workspace root** (`~/workspace/<team>`, not this
 directory) and try `/fix-issue <number>`. Agents run from the workspace root so
 cross-repo discovery is plain directory traversal.
 
+Once it is running, [`docs/USING.md`](docs/USING.md) is the day-to-day guide: the
+operating loop, which directory to open for which tools, and the handful of things
+that look like success and are not.
+
 LiteLLM has no Homebrew formula. `setup.sh` installs it with
 `uv tool install "litellm[proxy]"` — do not `brew install litellm`.
 
@@ -137,8 +141,10 @@ here is fictional.
 shared schema is the point — it is what makes cross-repo blast radius real.
 
 - [`answers.yaml`](examples/acme/answers.yaml) — a working `bin/init --answers` input
-- [`config/`](examples/acme/config/) — exactly what `bin/init` generates from it, including a
-  [`workspace-context.md`](examples/acme/config/workspace-context.md) worth copying
+- [`config/`](examples/acme/config/) — what `bin/init` generates from it, with
+  [`workspace-context.md`](examples/acme/config/workspace-context.md) filled in the way
+  `/harness-init` does (the raw generated version is deliberately a stub). That file is
+  the one to steal.
 - [`walkthrough.md`](examples/acme/walkthrough.md) — one `/fix-issue` run against a schema
   change that has to land in both repos, showing which local tool fires when, what the
   frontier model never sees, and the resulting usage report
@@ -280,6 +286,9 @@ proxy state.
 | `bin/local` | The aliases from your shell, outside any agent session: `summarize`, `draft`, `ask`, `search`, `index`, `models`, `health`. |
 | `bin/usage-report` | Token totals, per-route and per-tool breakdown, and the fallback invocation count from `var/usage.jsonl`, alongside frontier usage read from your Claude Code transcripts. `--days N`, `--since DATE`, `--by-tool`, `--json`. |
 | `bin/eval` | Replay `evals/cases.yaml`; `local-big` judges whether the trap was avoided. `--case ID`, `--filter PATTERN`, `--list`. Run before/after context changes, not in CI. |
+| `bin/litellm-agent` | Install the proxy as a LaunchAgent so it survives reboots and crashes: `install`, `uninstall`, `start`, `stop`, `restart`, `status`. Once installed it **owns** the proxy — `setup.sh --stop` becomes a no-op, so use `restart` here to pick up an edited profile. |
+| `bin/litellm-serve` | Foreground proxy for launchd; takes no arguments and is not meant to be run by hand. `bin/litellm-agent` invokes it. |
+| `bin/issue-watch` | Run a repo's own poll script on an interval, unattended: `install --repo <path>`, `status`, `list`, `logs`, `run`, `start`/`stop`/`restart`, `uninstall`. Refuses to install a job whose environment would fail every tick. See [`docs/USING.md`](docs/USING.md). |
 
 Every script takes `--help`, and the help text is the reference.
 
