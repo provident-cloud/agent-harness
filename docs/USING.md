@@ -24,12 +24,15 @@ likely to leave you wondering where a command went.
 | Open Claude Code at | Slash commands | Offload / delegate MCP tools |
 |---|---|---|
 | the workspace root | `/fix-issue`, `/review-pr`, `/delegate`, `/harness-init` | yes |
-| `acme-web/` | that repo's five: `/dev-loop`, `/build-out`, `/release`, `/ship-testflight`, `/setup-release-secrets` | yes — it has its own `.mcp.json` |
-| `acme-api/` | the same five names, already diverged | **no** — no `.mcp.json` there yet |
+| `acme-api/` | that repo's own skills, and only those | yes — it has its own `.mcp.json` |
+| `acme-web/` | its own skills, which may share names with the other repo's and still differ | **no** — none there yet |
 
 Rule of thumb: **cross-repo work → the workspace root; building or shipping one
 repo → that repo's root.** The harness commands and a repo's own skills never
 appear together, by design.
+
+Two repos can define the same skill name and mean different things by it. Which
+repo you opened decides which policy you get; that is load-bearing, not cosmetic.
 
 **3. Unattended — `bin/issue-watch`.** It runs `<repo>/.claude/dev-loop/poll` on a
 launchd interval, in a sane environment, and reports the exit code. That sentence
@@ -90,10 +93,8 @@ A decision list, not a feature tour.
 
 | You want to | Do this |
 |---|---|
-| Fix something that touches both repos | Workspace root → `/fix-issue <n>`. It searches for blast radius, compresses logs, states a per-repo plan, opens a PR per repo. |
-| Drive one repo's issue → PR pipeline | That repo's root → `/dev-loop`. |
-| Merge a round of work in one repo | That repo's root → `/build-out`, and state the merge scope in your own words. Its §0 gate will not merge without it and no flag grants it. |
-| Cut a release | That repo's root → `/release`, or `/ship-testflight` as the fallback runbook. |
+| Fix something that touches more than one repo | Workspace root → `/fix-issue <n>`. It searches for blast radius, compresses logs, states a per-repo plan, opens a PR per repo. |
+| Drive one repo's issue → PR pipeline, merge a round, cut a release | That repo's root → whichever of its own skills covers it. The harness deliberately knows nothing about those; a skill that merges should take its scope from a human who is present. |
 | Read something large before spending frontier tokens on it | `compress_context` (MCP), or `bin/local summarize <file>` from a shell. |
 | Ask "where is this handled?" across repos | `workspace_search` (MCP), or `bin/local search <query>`. Needs a fresh index. |
 | Write a commit message, PR body, or changelog | `draft` (MCP), or `bin/local draft commit`. Better: install the git hook once per repo and never think about it again — `ln -sf <harness>/claude/hooks/commit-msg-local.sh .git/hooks/prepare-commit-msg`. It prefills from the staged diff and can never fail a commit. |
@@ -174,28 +175,11 @@ why they are install-time errors instead of documentation.
 `status` warns when the last tick is older than 2× the interval. That is the one
 failure that leaves no log line at all.
 
-## State of this machine
-
-**Snapshot, 2026-08-21 — this section goes stale. Re-check, don't trust.**
-
-- **The watch is paused.** `~/poll-worktree/.claude/dev-loop/pause` has existed since
-  2026-08-17; every tick since has logged `skip: paused`. It also targets
-  `~/poll-worktree` — a `acme-web` worktree *outside* `workspace_root`,
-  which means it is a repo `config/repos.yaml` does not list and `bin/local index`
-  has never indexed.
-- **The search index is stale**, last built 2026-08-17. Run `bin/local index`
-  before trusting a `workspace_search` result.
-- **`acme-api` has no `.mcp.json`**, so sessions opened there get no
-  offload or delegate tools. `acme-web`'s version already uses the
-  portable `${HARNESS_ROOT:-../agent-harness}` form and is a clean candidate port.
-- **`.envrc` has `ANTHROPIC_API_KEY` and `OSS_API_KEY` empty.** On this 128GB tier
-  that is fine for normal work — `local-big` is local — but it means the
-  `local-big → local-big-remote` fallback rung cannot fire. A local failure fails
-  outright instead of degrading.
-- **Codex agentic tool use does not work through the LiteLLM bridge.** Codex
-  0.149.0 sends tools as Responses `namespace` entries and LiteLLM 1.96.0 drops
-  them; text-only turns work. This affects driving Codex off local models, not
-  `/delegate`, which is the frontier rung by definition.
+**A watch can point anywhere**, including a worktree outside `workspace_root`.
+Nothing stops you, and nothing warns you: such a repo is not in `config/repos.yaml`
+and `bin/local index` has never indexed it, so `workspace_search` cannot see the
+code the loop is working on. Check the `repo` line in `status --name <w>` against
+`config/harness.yaml` before assuming the two agree.
 
 ## Where to go next
 
@@ -203,6 +187,6 @@ failure that leaves no log line at all.
 |---|---|
 | Why is it built this way? Tiers, costs, kill rules | [`README.md`](../README.md) |
 | Setting it up on a new machine; something is broken | [`AGENTS.md`](../AGENTS.md) — *Picking up on a new machine*, *If it breaks* |
-| What `/dev-loop` costs, and why concurrency is not the win | [`dev-loop-baseline.md`](dev-loop-baseline.md) |
+| What an unattended poll loop costs, and why concurrency is not the win | [`dev-loop-baseline.md`](dev-loop-baseline.md) |
 | What a clean two-repo instantiation looks like | [`examples/acme/`](../examples/acme/) |
 | Exact flags for any script | `bin/<script> --help` |
