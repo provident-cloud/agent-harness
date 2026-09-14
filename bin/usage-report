@@ -23,6 +23,11 @@ import harness_lib as h
 # harness owns this directory, so every read is best-effort and read-only.
 TRANSCRIPT_ROOT = Path.home() / ".claude" / "projects"
 
+# Codex CLI writes one JSONL rollout per session under here. Same ownership
+# story as the transcripts above: another program's internal format, so every
+# read is best-effort and read-only.
+CODEX_ROOT = Path.home() / ".codex" / "sessions"
+
 ROUTES = ("local", "remote", "frontier")
 
 # --------------------------------------------------------------------------
@@ -757,6 +762,249 @@ def print_proxies(data: dict[str, Any], weeks: dict[str, dict[str, Any]]) -> Non
 
 
 # --------------------------------------------------------------------------
+# Source 3: Codex rollouts (best effort, read-only)
+# --------------------------------------------------------------------------
+#
+# The third rung. Delegated work is metered frontier spend on the operator's own
+# subscription, and until this section existed it was the one route that showed
+# nowhere -- so a task handed off looked free. It is not.
+#
+# Shape of a rollout: one JSONL per session. `session_meta` opens it with the cwd
+# and CLI version, each model response appends a `token_usage_record`, and an
+# `event_msg`/`token_count` carries the plan and the rate-limit window. The model
+# name moved between CLI versions, so it is read from whichever of three places
+# has it.
+
+
+def _blank_codex() -> dict[str, Any]:
+    return {
+        "sessions": 0,
+        "turns": 0,
+        "responses": 0,
+        # `input` is the billed total; `cached` is the discounted part of it. The
+        # difference is what actually costs, so both are kept rather than netted.
+        "input": 0,
+        "cached": 0,
+        "cache_write": 0,
+        "output": 0,
+        # Billed as output and never shown in the reply. Separated because a run
+        # that reasons hard looks cheap by reply length and is not.
+        "reasoning": 0,
+        "total": 0,
+        "duration_ms": 0,
+    }
+
+
+_CODEX_SUMS = ("turns", "responses", "input", "cached", "cache_write", "output",
+               "reasoning", "total", "duration_ms")
+
+
+def _codex_session(path: Path) -> dict[str, Any] | None:
+    """One rollout -> one session row, or None when it holds no model response."""
+    row: dict[str, Any] = {
+        "cwd": None, "model": None, "plan": None, "cli": None,
+        "started": None, "used_percent": None,
+    }
+    row.update({key: 0 for key in _CODEX_SUMS})
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = record.get("type")
+        payload = record.get("payload") or {}
+        if kind == "session_meta":
+            row["cwd"] = payload.get("cwd") or row["cwd"]
+            row["cli"] = payload.get("cli_version") or row["cli"]
+            row["started"] = parse_ts(payload.get("timestamp") or record.get("timestamp"))
+            row["model"] = payload.get("model") or row["model"]
+        elif kind == "turn_context":
+            row["model"] = payload.get("model") or row["model"]
+        elif kind == "token_usage_record":
+            usage = payload.get("usage") or {}
+            row["responses"] += 1
+            for src, dst in (("input_tokens", "input"),
+                             ("cached_input_tokens", "cached"),
+                             ("cache_write_input_tokens", "cache_write"),
+                             ("output_tokens", "output"),
+                             ("reasoning_output_tokens", "reasoning"),
+                             ("total_tokens", "total")):
+                try:
+                    row[dst] += int(usage.get(src) or 0)
+                except (TypeError, ValueError):
+                    pass
+        elif kind == "event_msg":
+            inner = payload.get("type")
+            if inner == "token_count":
+                limits = payload.get("rate_limits") or {}
+                row["plan"] = limits.get("plan_type") or row["plan"]
+                primary = limits.get("primary") or {}
+                if primary.get("used_percent") is not None:
+                    row["used_percent"] = primary["used_percent"]
+                row["model"] = row["model"] or (payload.get("info") or {}).get("model")
+            elif inner == "task_complete":
+                row["turns"] += 1
+                try:
+                    row["duration_ms"] += int(payload.get("duration_ms") or 0)
+                except (TypeError, ValueError):
+                    pass
+    return row if row["responses"] else None
+
+
+def scan_codex(since: datetime, root: Path = CODEX_ROOT) -> dict[str, Any]:
+    """Sum Codex token usage per session and per working directory."""
+    result: dict[str, Any] = {
+        "available": False,
+        "reason": None,
+        "root": str(root),
+        "files_found": 0,
+        "files_scanned": 0,
+        "files_unreadable": 0,
+        "sessions": [],
+        "by_cwd": {},
+        "totals": _blank_codex(),
+        "plans": [],
+        "used_percent": None,
+    }
+    if not root.is_dir():
+        result["reason"] = f"no Codex session directory at {root}"
+        return result
+
+    files = sorted(root.rglob("*.jsonl"))
+    result["files_found"] = len(files)
+    if not files:
+        result["reason"] = f"no *.jsonl rollouts under {root}"
+        return result
+
+    result["available"] = True
+    by_cwd: dict[str, dict[str, Any]] = defaultdict(_blank_codex)
+    plans: set[str] = set()
+    pcts: list[float] = []
+
+    for path in files:
+        # mtime is a cheap pre-filter; `started` below is the authority.
+        try:
+            touched = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+        except OSError:
+            result["files_unreadable"] += 1
+            continue
+        if touched < since:
+            continue
+        row = _codex_session(path)
+        if row is None:
+            result["files_unreadable"] += 1
+            continue
+        if row["started"] is None:
+            row["started"] = touched
+        if row["started"] < since:
+            continue
+
+        result["files_scanned"] += 1
+        row["path"] = str(path)
+        result["sessions"].append(row)
+        if row["plan"]:
+            plans.add(row["plan"])
+        if row["used_percent"] is not None:
+            pcts.append(row["used_percent"])
+
+        name = Path(row["cwd"]).name if row["cwd"] else "?"
+        bucket = by_cwd[name]
+        bucket["sessions"] += 1
+        for key in _CODEX_SUMS:
+            bucket[key] += row[key]
+
+    totals = _blank_codex()
+    totals["sessions"] = len(result["sessions"])
+    for row in result["sessions"]:
+        for key in _CODEX_SUMS:
+            totals[key] += row[key]
+
+    result["sessions"].sort(key=lambda r: r["started"])
+    result["totals"] = totals
+    result["by_cwd"] = dict(by_cwd)
+    result["plans"] = sorted(plans)
+    result["used_percent"] = max(pcts) if pcts else None
+    if not result["sessions"]:
+        result["reason"] = (
+            f"{result['files_found']} rollout(s) found, none with usage inside the window"
+        )
+    return result
+
+
+def print_codex(data: dict[str, Any], *, by_repo: bool) -> None:
+    heading("Codex usage (delegated frontier)")
+    if not data["available"] or not data["sessions"]:
+        print("  Codex usage data unavailable")
+        print(_d(f"  {data['reason']}"))
+        return
+
+    totals = data["totals"]
+    fresh = totals["input"] - totals["cached"]
+    print(
+        f"  sessions {num(totals['sessions'])}   turns {num(totals['turns'])}   "
+        f"model responses {num(totals['responses'])}"
+    )
+    print(
+        f"  tokens in {num(totals['input'])} ({num(fresh)} fresh, "
+        f"{num(totals['cached'])} cached {pct(totals['cached'], totals['input'])})   "
+        f"out {num(totals['output'])} (reasoning {num(totals['reasoning'])})"
+    )
+    print(f"  total {num(totals['total'])}   wall clock {totals['duration_ms'] / 1000:.0f}s")
+    if data["plans"]:
+        line = f"  plan {'/'.join(data['plans'])}"
+        if data["used_percent"] is not None:
+            line += f"   window limit used {data['used_percent']:.1f}% (latest reading)"
+        print(line)
+    if data["files_unreadable"]:
+        print(_d(f"  skipped {num(data['files_unreadable'])} unreadable rollout(s)"))
+
+    heading("Codex per session")
+    rows = []
+    for row in data["sessions"]:
+        rows.append([
+            row["started"].astimezone().strftime("%m-%d %H:%M"),
+            (Path(row["cwd"]).name if row["cwd"] else "?")[:24],
+            row["model"] or "-",
+            num(row["turns"]),
+            num(row["responses"]),
+            num(row["input"] - row["cached"]),
+            num(row["cached"]),
+            num(row["output"]),
+            num(row["total"]),
+            f"{row['duration_ms'] / 1000:.0f}s",
+        ])
+    table(
+        ["started", "cwd", "model", "turns", "resp", "fresh in", "cached", "out", "total", "wall"],
+        rows,
+        align_right={3, 4, 5, 6, 7, 8, 9},
+    )
+
+    if by_repo:
+        heading("Codex per working directory")
+        ordered = sorted(data["by_cwd"].items(), key=lambda kv: -kv[1]["total"])
+        table(
+            ["cwd", "sessions", "fresh in", "cached", "out", "total"],
+            [
+                [name, num(b["sessions"]), num(b["input"] - b["cached"]),
+                 num(b["cached"]), num(b["output"]), num(b["total"])]
+                for name, b in ordered
+            ],
+            align_right={1, 2, 3, 4, 5},
+        )
+
+    print()
+    print(_d("  Cached input bills at a discount, so `fresh in` is the column that tracks"))
+    print(_d("  cost; a high cached share means the session reused its context well."))
+    print(_d("  Reasoning output is billed and never appears in the reply, so a run that"))
+    print(_d("  thinks hard looks cheap by reply length and is not."))
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -767,7 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Where the tokens went: local offload calls and frontier spend.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Two independent sources, reported side by side:
+Three independent sources, reported side by side -- one per rung:
 
   offload    var/usage.jsonl, written by every h.chat()/h.embed() call the MCP
              tools, hooks and bin/local make. Calls, tokens, latency, success
@@ -777,11 +1025,16 @@ Two independent sources, reported side by side:
   frontier   best-effort read of ~/.claude/projects/**/*.jsonl. Read-only, and
              skipped with a notice if the files are absent or the shape changed.
 
+  codex      best-effort read of ~/.codex/sessions/**/*.jsonl, on the same terms.
+             Delegated work is metered spend on your own subscription; before
+             this section it showed nowhere, so a handed-off task looked free.
+
 Typical use:
 
   bin/usage-report                      last 7 days
   bin/usage-report --days 30 --by-tool  a month, broken out per tool and alias
   bin/usage-report --since 2026-07-01   from a fixed date
+  bin/usage-report --by-repo            Codex broken out per working directory
   bin/usage-report --json | jq .        the same numbers, structured
 
 Baseline one week before shipping a new offload path, then compare. A proxy
@@ -801,6 +1054,10 @@ that does not move turns-per-task is the kill rule's cue.
     parser.add_argument(
         "--frontier-only", action="store_true", help="skip the offload journal section"
     )
+    parser.add_argument(
+        "--by-repo", action="store_true", help="add the per-working-directory Codex breakdown"
+    )
+    parser.add_argument("--no-codex", action="store_true", help="skip the Codex section")
     return parser
 
 
@@ -820,6 +1077,7 @@ def main(argv: list[str] | None = None) -> int:
 
     frontier = scan_transcripts(since)
     weeks = weekly_trend(frontier.get("sessions") or {})
+    codex = None if args.no_codex else scan_codex(since)
 
     if args.json:
         payload = {
@@ -843,6 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
                 "sessions": frontier["sessions"],
                 "weekly_trend": weeks,
             },
+            "codex": codex,
             "not_measurable": {
                 "human_corrections_per_task": (
                     "indistinguishable from a normal follow-up turn; needs a retro marker "
@@ -861,6 +1120,8 @@ def main(argv: list[str] | None = None) -> int:
     frontier_only_note = args.frontier_only
     print_frontier(frontier)
     print_proxies(frontier, weeks)
+    if codex is not None:
+        print_codex(codex, by_repo=args.by_repo)
     if frontier_only_note:
         print()
         print(_d("  (--frontier-only: offload journal skipped)"))
