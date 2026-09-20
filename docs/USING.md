@@ -74,7 +74,9 @@ pulling code.** Nothing warns you when it is stale — `workspace_search` will
 answer confidently about code that has since changed, which is worse than an
 error. `--repo NAME` narrows it; `--force` rebuilds from scratch.
 
-**`bin/usage-report`** is how "free and local" stays true. The number to watch is
+**`bin/usage-report`** is how "free and local" stays true. It reports three rungs — the
+local offload journal, your Claude Code transcripts, and your Codex rollouts — so no route
+is invisible; `--by-repo` breaks Codex out per working directory. The number to watch is
 FALLBACK INVOCATIONS:
 
 ```
