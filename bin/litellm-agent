@@ -49,10 +49,9 @@ LABEL="local.agent-harness.litellm"
 TEMPLATE="$ROOT/launchd/$LABEL.plist.template"
 TARGET="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
-# Earlier versions used a different reverse-DNS prefix for the same job. Any
-# plist ending in this suffix that is not $TARGET is that older install: it holds
-# :4000 and would make the new job crash-loop, so install migrates it and status
-# warns about it.
+# Earlier versions labelled the same job sh.<name>.harness.litellm. Such a plist
+# is that older install: it holds :4000 and would make the new job crash-loop, so
+# install migrates it (only after launchd confirms it unloaded) and status warns.
 LEGACY_DIR="$HOME/Library/LaunchAgents"
 
 C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
@@ -144,7 +143,7 @@ wait_healthy() {
 
 legacy_plists() {
   local f
-  for f in "$LEGACY_DIR"/*.harness.litellm.plist; do
+  for f in "$LEGACY_DIR"/sh.*.harness.litellm.plist; do
     [ -f "$f" ] && [ "$f" != "$TARGET" ] && printf '%s\n' "$f"
   done
   return 0
@@ -157,8 +156,13 @@ migrate_legacy() {
     label="$(basename "$f" .plist)"
     warn "found an older install under a previous label: $label -- migrating it"
     launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+    local i=0
+    while launchctl print "$DOMAIN/$label" >/dev/null 2>&1; do
+      [ "$i" -lt 30 ] || die "old job $label is still loaded after 30s; nothing changed. Try: launchctl bootout $DOMAIN/$label"
+      sleep 1; i=$((i + 1))
+    done
     rm -f "$f"
-    ok "removed $f"
+    ok "unloaded and removed $f"
   done < <(legacy_plists)
 }
 

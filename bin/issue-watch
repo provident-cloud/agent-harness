@@ -109,12 +109,13 @@ build_path() {
 # --- launchd helpers ---------------------------------------------------------
 
 label_for() { printf '%s.%s' "$LABEL_PREFIX" "$1"; }
-# Earlier versions used a different reverse-DNS prefix. A leftover job with the
-# same watch name would tick alongside the new one -- two billed runs per
-# interval -- so install removes it and list warns about any.
+# Earlier versions labelled watches sh.<name>.harness.watch.<watch>. A leftover
+# job with the same watch name would tick alongside the new one -- two billed
+# runs per interval -- so install removes it (only after launchd confirms it
+# unloaded) and list warns about any.
 legacy_plists() {
   local f
-  for f in "$AGENTS_DIR"/*.harness.watch.*.plist; do
+  for f in "$AGENTS_DIR"/sh.*.harness.watch.*.plist; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in "$LABEL_PREFIX".*) continue ;; esac
     printf '%s\n' "$f"
@@ -129,8 +130,13 @@ migrate_legacy() {
     [ "${label##*.harness.watch.}" = "$name" ] || continue
     warn "found watch '$name' under a previous label: $label -- migrating it"
     launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+    local i=0
+    while launchctl print "$DOMAIN/$label" >/dev/null 2>&1; do
+      [ "$i" -lt 30 ] || die "old watch $label is still loaded after 30s; nothing changed. Try: launchctl bootout $DOMAIN/$label"
+      sleep 1; i=$((i + 1))
+    done
     rm -f "$f"
-    ok "removed $f"
+    ok "unloaded and removed $f"
   done < <(legacy_plists)
 }
 plist_for() { printf '%s/%s.%s.plist' "$AGENTS_DIR" "$LABEL_PREFIX" "$1"; }
@@ -272,7 +278,7 @@ cmd_list() {
   [ "$found" = 1 ] || dim "no watches installed"
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    warn "watch under a previous label: $f -- re-run install for it (it migrates)"
+    warn "watch under a previous label: $f -- re-run install with the same --name/--script/--interval (plutil -p shows them); install migrates it"
   done < <(legacy_plists)
 }
 
