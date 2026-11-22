@@ -95,7 +95,10 @@ down per tool and alias; `--days N` or `--since DATE` sets the window.
 bin/eval --checks-only --strict      # deterministic self-checks, no proxy needed
 ```
 
-These are `evals/checks.yaml`: no agent, no judge, a few seconds. One of them,
+These are `evals/checks.yaml`: no agent, no judge, under a minute. `mcp-replay`
+drives both MCP servers through a fixed session against a fake proxy and a fake
+`codex`, and fails if a tool, schema, error message or progress line changed.
+One of them,
 `no-org-names`, fails if a team, org, product or person name appears in a
 tracked file's path or content (read from git's index, so a staged name counts).
 Under `--strict` a self-check that skips or is disabled also fails. Your own team's names go in
@@ -112,6 +115,21 @@ install` per watch **with the same `--name`, `--script` and `--interval`**
 watch running beside the new one). Install unloads the old job, waits until
 launchd confirms it is gone, then deletes its plist; if it will not unload,
 install stops and changes nothing.
+
+**The MCP servers run on mcp 2.x** (`mcp>=2.3,<3`). Nothing you call changed:
+same tools, same schemas, same messages, checked by `mcp-replay`. The first
+session after you pull is a few seconds slower while `uv` resolves the new
+SDK. On the classic `initialize` handshake (what every client used with the
+old servers) the only differences are display-only: no empty `experimental`
+capability, and an empty `serverInfo.version` (mcp 1.x put its own package
+version there).
+
+One real difference for **clients on the 2026-07-28 protocol**: the spec makes
+log messages a per-request opt-in, so the index-progress lines
+`workspace_search` prints while building the index reach such a client only if
+it sends `io.modelcontextprotocol/logLevel` (e.g. `info`) in the request's
+`_meta`. The result is the same either way; only the progress is silent.
+`mcp-modern` pins this.
 
 ## Choosing a tool
 

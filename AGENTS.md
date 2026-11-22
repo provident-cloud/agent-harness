@@ -29,10 +29,11 @@ is the changelog. Beyond the original design:
   CLI sessions. Requires `codex login`. Every call journaled as `route=frontier`.
 - **Response caching**: LiteLLM disk cache (24h TTL, `var/litellm-cache`) plus
   cache-hit labeling in `bin/usage-report`.
-- **Upstream version pins**: `fastapi<0.140` in `setup.sh`, and `mcp>=1.9,<2` in
-  both `mcp/*/server.py` PEP-723 headers. Both are ceilings, not fixes — the MCP
-  servers still target the retired FastMCP API and need a port to
-  `mcp.server.mcpserver` before `mcp` 2.x is usable. See *If it breaks*.
+- **Upstream version pins**: `fastapi<0.140` in `setup.sh` (a ceiling, not a
+  fix), and `mcp>=2.3,<3` in both `mcp/*/server.py` PEP-723 headers. The servers
+  use `mcp.server.mcpserver.MCPServer`. The `mcp-replay` self-check pins their
+  observable behaviour to a recording first made on mcp 1.x; run it after any
+  SDK bump.
 
 Hard-won facts live in code comments where they matter (reasoning models return
 empty strings; Codex MCP quirks in `mcp/delegate-server/server.py`; the cache-hit
@@ -81,8 +82,11 @@ bin/litellm-agent install  # LaunchAgent: proxy survives reboots and crashes
   real `ImportError` and retries a bare import, so the traceback names the wrong
   thing. It is the fastapi pin. Get the true cause with
   `~/.local/share/uv/tools/litellm/bin/python -c "import litellm.proxy.proxy_server"`.
-- **`No module named 'mcp.server.fastmcp'`** — `mcp` resolved to 2.x; the `<2` pin
-  was lost.
+- **`No module named 'mcp.server.fastmcp'`** — you are running a pre-port copy of
+  a server against mcp 2.x. Pull; both servers now target `MCPServer`.
+- **`mcp-replay` drifts after an SDK bump** — read the diff before re-recording.
+  Re-record (`evals/checks/mcp_replay.py --record evals/fixtures/mcp-replay.json`)
+  only when every changed line is a deliberate behaviour change.
 - **`bin/local health` showing `0.00s`** — the LiteLLM disk cache replayed an
   identical probe. It does not mean the model is fast. Cold `local-big` is ~9s, and
   generation is ~11 tok/s.

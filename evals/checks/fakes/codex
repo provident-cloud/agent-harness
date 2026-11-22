@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""A stand-in for the Codex CLI, for replay checks. Not a model: canned replies.
+
+Covers exactly what mcp/delegate-server uses:
+
+* ``codex mcp list --json``  -> ``[]`` (no personal MCP servers to disable)
+* ``codex mcp-server``       -> newline-delimited JSON-RPC on stdio:
+  ``initialize``, ``tools/call`` for ``codex`` and ``codex-reply``, with
+  ``codex/event`` notifications (token_count, agent_message) stamped with
+  ``_meta.requestId`` the way the real CLI does.
+
+In a workspace-write sandbox it writes ``DELEGATED-<n>.md`` into ``cwd`` so the
+caller has a diff to summarise. Knobs for concurrency/kill tests:
+FAKE_CODEX_SLEEP (seconds to hold each call), FAKE_CODEX_LOG (append one JSON
+line per call: pid, cwd, sandbox, file written).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+_lock = threading.Lock()
+_threads: dict[str, str] = {}
+_counter = [0]
+
+
+def send(obj: dict) -> None:
+    with _lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def event(rid: int, msg: dict) -> None:
+    send({"jsonrpc": "2.0", "method": "codex/event",
+          "params": {"_meta": {"requestId": rid}, "msg": msg}})
+
+
+def handle_call(rid: int, name: str, args: dict) -> None:
+    delay = float(os.environ.get("FAKE_CODEX_SLEEP") or 0)
+    if name == "codex":
+        with _lock:
+            _counter[0] += 1
+            n = _counter[0]
+        cwd = Path(args.get("cwd") or ".")
+        sandbox = str(args.get("sandbox") or "")
+        thread_id = f"thread-{n}"
+        _threads[thread_id] = str(cwd)
+        if delay:
+            time.sleep(delay)
+        written = ""
+        if sandbox == "workspace-write":
+            target = cwd / f"DELEGATED-{n}.md"
+            target.write_text(f"# delegated\n\n{args.get('prompt', '')}\n")
+            written = str(target)
+        log = os.environ.get("FAKE_CODEX_LOG")
+        if log:
+            with open(log, "a") as fh:
+                fh.write(json.dumps({"pid": os.getpid(), "cwd": str(cwd), "sandbox": sandbox,
+                                     "written": written, "model": args.get("model", "")}) + "\n")
+        event(rid, {"type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 1200, "output_tokens": 34}}})
+        event(rid, {"type": "agent_message", "message": f"fake codex finished ({sandbox})"})
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "content": [{"type": "text", "text": f"fake codex: done in {sandbox} sandbox"}],
+            "structuredContent": {"threadId": thread_id}}})
+    elif name == "codex-reply":
+        thread_id = str(args.get("threadId") or "")
+        if thread_id not in _threads:
+            send({"jsonrpc": "2.0", "id": rid, "result": {
+                "content": [{"type": "text", "text": "Session not found for thread_id"}],
+                "isError": True}})
+            return
+        if delay:
+            time.sleep(delay)
+        event(rid, {"type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": 300, "output_tokens": 12}}})
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "content": [{"type": "text", "text": f"fake codex: replied on {thread_id}"}],
+            "structuredContent": {"threadId": thread_id}}})
+    else:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"no tool {name}"}})
+
+
+def mcp_server() -> int:
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        method, rid = msg.get("method"), msg.get("id")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": rid, "result": {
+                "protocolVersion": msg["params"].get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-codex", "version": "0"}}})
+        elif method == "tools/call":
+            # one thread per call, so concurrent calls overlap like the real CLI
+            p = msg.get("params") or {}
+            threading.Thread(target=handle_call, args=(rid, p.get("name"), p.get("arguments") or {}),
+                             daemon=True).start()
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv[:3] == ["mcp", "list", "--json"]:
+        print("[]")
+        return 0
+    if argv[:1] == ["mcp-server"]:
+        return mcp_server()
+    if argv[:1] == ["--version"]:
+        print("codex-cli 0.0.0-fake")
+        return 0
+    print(f"fake codex: unsupported args {argv}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
