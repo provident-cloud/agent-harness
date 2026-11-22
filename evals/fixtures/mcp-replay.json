@@ -96,7 +96,6 @@
     ],
     "initialize": {
       "capabilities": [
-        "experimental",
         "prompts",
         "resources",
         "tools"
@@ -301,7 +300,6 @@
     ],
     "initialize": {
       "capabilities": [
-        "experimental",
         "prompts",
         "resources",
         "tools"
