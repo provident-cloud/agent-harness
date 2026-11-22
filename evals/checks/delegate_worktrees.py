@@ -139,8 +139,11 @@ def main() -> int:
         # 1. concurrent -------------------------------------------------------
         # Each fake waits at a barrier until the other has entered: if the server
         # ran the two tasks one after the other, the barrier would time out.
+        # They also hold 2s after it, so the two leases are observable together
+        # (on a fast runner both tasks otherwise finish before the first poll).
         srv = Server(target, root, tmp, {"FAKE_BARRIER_DIR": str(tmp / "barrier"),
-                                         "FAKE_BARRIER_COUNT": "2", "FAKE_CODEX_LOG": str(log)})
+                                         "FAKE_BARRIER_COUNT": "2", "FAKE_CODEX_LOG": str(log),
+                                         "FAKE_CODEX_SLEEP": "2", "FAKE_CLAUDE_SLEEP": "2"})
         t0 = time.time()
         srv.start_call(101, "delegate", {"task": "task A", "repo": "demo", "mode": "edit",
                                          "adapter": "codex"})
