@@ -156,6 +156,12 @@ def main() -> int:
         entries = [json.loads(ln) for ln in log.read_text().splitlines()] if log.exists() else []
         check(len(entries) == 2 and all(e.get("barrier_met") for e in entries),
               f"concurrent: both agents were running at the same moment ({elapsed:.1f}s)")
+        if not overlapped or elapsed > 10:  # diagnostics for a slow or serialized run
+            for e in entries:
+                print(f"     agent {e.get('cli')}: started +{e.get('t_start', 0) - t0:.1f}s, "
+                      f"done +{e.get('t_done', 0) - t0:.1f}s")
+            for f in sorted(tmp.glob("server-*.stderr")):
+                print("     " + f.read_text()[-1500:].replace("\n", "\n     "))
         cwds = {e["cwd"] for e in entries}
         check(len(entries) == 2 and len(cwds) == 2 and all(str(wt_root) in c for c in cwds),
               "concurrent: each agent ran in a different task worktree, neither in the checkout")

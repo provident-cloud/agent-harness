@@ -29,6 +29,8 @@ import sys
 import time
 from pathlib import Path
 
+T0 = time.time()
+
 
 def emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
@@ -133,7 +135,7 @@ def run(resume: bool, args: list[str]) -> int:
         with open(log, "a") as fh:
             fh.write(json.dumps({"pid": os.getpid(), "cwd": str(cwd), "sandbox": sandbox,
                                  "written": written, "model": opts.get("-m", ""),
-                                 "cli": "codex", "barrier_met": met}) + "\n")
+                                 "cli": "codex", "barrier_met": met, "t_start": T0, "t_done": time.time()}) + "\n")
     text = f"fake codex: replied on {thread}" if resume else f"fake codex: done in {sandbox} sandbox"
     emit({"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": text}})
     usage = (300, 12) if resume else (1200, 34)

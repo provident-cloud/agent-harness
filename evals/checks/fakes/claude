@@ -24,6 +24,8 @@ import sys
 import time
 from pathlib import Path
 
+T0 = time.time()
+
 
 def main(argv: list[str]) -> int:
     if argv[:1] in (["--version"], ["-v"]):
@@ -100,7 +102,7 @@ def main(argv: list[str]) -> int:
         with open(log, "a") as fh:
             fh.write(json.dumps({"pid": os.getpid(), "cwd": str(cwd), "sandbox": mode,
                                  "written": written, "model": model, "cli": "claude",
-                                 "barrier_met": met}) + "\n")
+                                 "barrier_met": met, "t_start": T0, "t_done": time.time()}) + "\n")
     text = (f"fake claude: replied on {session}" if resume
             else f"fake claude: done in {mode} mode" + (" (model pinned)" if model else ""))
     print(json.dumps({
