@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -54,6 +55,9 @@ class Task:
     model: str | None
     brief: str
     timeout_s: int
+    # Where to note the agent's process group (pgid + start time), so a startup
+    # sweep can stop an agent orphaned by a SIGKILLed server. None: not noted.
+    agent_record: Path | None = None
 
 
 @dataclass
@@ -67,57 +71,34 @@ class Result:
 
 
 # --------------------------------------------------------------------------
-# Codex child session
+# Codex CLI: one `codex exec --json` process per call.
 #
-# Deliberately NOT the mcp SDK's ClientSession: Codex narrates sessions as
-# `codex/event` notifications, and the SDK validates notifications against
-# its known-type union and drops unknown methods ("Failed to validate
-# notification ... log and continue"). Those events carry the token counts
-# the usage journal needs and the MCP-startup evidence the sprawl guard
-# checks, so this speaks newline-delimited JSON-RPC to the child directly.
+# codex-cli 0.171 has no `mcp-server` subcommand any more (`codex mcp-server`
+# now starts the interactive CLI and exits "stdin is not a terminal"), so the
+# old shared JSON-RPC child is gone. A process per call is also the only way to
+# guarantee that a timed-out or cancelled task really stops: its process group
+# is killed, and nothing else shares it. Probed live against 0.171.0:
+#
+#   codex exec --json -s <sandbox> -C <dir> -c ... -- <prompt>
+#   codex exec resume --json -c ... -- <thread_id> <prompt>   (cwd = the dir)
+#
+# emit JSON lines: thread.started{thread_id}, turn.started,
+# item.completed{item: agent_message{text} | error{message}},
+# turn.completed{usage: input_tokens, cached_input_tokens, output_tokens, ...},
+# and turn.failed / error on failure. An unknown thread exits 1 with
+# "no rollout found for thread id" on stderr. `resume` takes no -s/-C, so the
+# sandbox is pinned with -c sandbox_mode and the directory is the cwd.
 # --------------------------------------------------------------------------
-
-
-class _EventLog:
-    """What the harness keeps from the Codex event stream for one call."""
-
-    def __init__(self) -> None:
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        self.tokens_reported = False
-        self.mcp_servers_started: set[str] = set()
-        self.last_agent_message = ""
-        self.errors: list[str] = []
-
-    def feed(self, msg: dict[str, Any]) -> None:
-        kind = msg.get("type")
-        if kind == "token_count":
-            info = msg.get("info") or msg
-            usage = {}
-            if isinstance(info, dict):
-                usage = info.get("total_token_usage") or info.get("usage") or {}
-            if isinstance(usage, dict) and usage:
-                self.prompt_tokens = int(usage.get("input_tokens") or 0)
-                self.completion_tokens = int(usage.get("output_tokens") or 0)
-                self.tokens_reported = True
-        elif kind == "mcp_startup_update":
-            server = msg.get("server")
-            if server:
-                self.mcp_servers_started.add(str(server))
-        elif kind == "agent_message":
-            self.last_agent_message = str(msg.get("message") or self.last_agent_message)
-        elif kind == "error":
-            self.errors.append(str(msg.get("message") or "unknown codex error"))
 
 
 def _friendly_codex_error(text: str) -> str:
     low = text.lower()
     if "login" in low or "auth" in low or "unauthorized" in low or "401" in low:
         return (
-            f"Codex is not authenticated: {text.strip()} -- run `codex login` "
+            f"Codex is not authenticated: {text.strip()[:300]} -- run `codex login` "
             "in a terminal, then retry."
         )
-    return text.strip() or "codex session failed with no message"
+    return text.strip()[:600] or "codex session failed with no message"
 
 
 def _codex_reason(message: str) -> str:
@@ -128,181 +109,22 @@ def _codex_reason(message: str) -> str:
         return "timeout"
     if "not on path" in low:
         return "cli-missing"
-    if "session not found" in low:
+    if "no rollout found" in low or "session not found" in low:
         return "session-not-found"
     return "error-result"
 
 
-class _CodexChild:
-    """One persistent `codex mcp-server` child, shared by all tool calls.
-
-    Persistent because Codex session threads live in the child's memory:
-    `codex-reply` with a threadId only works in the process that created the
-    thread (verified -- a fresh child answers "Session not found"). JSON-RPC
-    ids multiplex concurrent calls on the one stream, and Codex stamps every
-    event notification with ``_meta.requestId``, so a single reader task can
-    route responses to futures and events to the right call's log.
-    """
-
-    def __init__(self) -> None:
-        self.proc = None
-        self._next_id = 0
-        self._futures: dict[int, Any] = {}
-        self._events: dict[int, _EventLog] = {}
-        self._lock = None  # created lazily on the running loop
-        self._reader = None
-
-    async def _ensure_started(self) -> None:
-        import asyncio
-        import json
-
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        async with self._lock:
-            if self.proc is not None and self.proc.returncode is None:
-                return
-            if shutil.which("codex") is None:
-                raise AdapterError(
-                    "the `codex` CLI is not on PATH. Install Codex CLI and "
-                    "run `codex login`, then retry."
-                )
-            self._futures.clear()
-            self._events.clear()
-            self.proc = await asyncio.create_subprocess_exec(
-                "codex", "mcp-server",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,  # own process group: shutdown kills its tool runs too
-            )
-            init_id = self._send({"method": "initialize", "params": {
-                "protocolVersion": "2025-06-18", "capabilities": {},
-                "clientInfo": {"name": "harness-delegate", "version": "1.0"}}})
-            self._reader = asyncio.create_task(self._read_loop())
-            fut = asyncio.get_running_loop().create_future()
-            self._futures[init_id] = fut
-            init = await asyncio.wait_for(fut, timeout=30)
-            if "error" in init:
-                raise AdapterError(_friendly_codex_error(str(init["error"].get("message"))))
-            self._send_raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
-
-    def _send(self, obj: dict[str, Any]) -> int:
-        self._next_id += 1
-        self._send_raw({"jsonrpc": "2.0", "id": self._next_id, **obj})
-        return self._next_id
-
-    def _send_raw(self, obj: dict[str, Any]) -> None:
-        import json
-
-        assert self.proc is not None and self.proc.stdin is not None
-        self.proc.stdin.write((json.dumps(obj) + "\n").encode())
-
-    async def _read_loop(self) -> None:
-        import json
-
-        assert self.proc is not None and self.proc.stdout is not None
-        while True:
-            line = await self.proc.stdout.readline()
-            if not line:
-                break
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            oid = obj.get("id")
-            if oid in self._futures and ("result" in obj or "error" in obj):
-                fut = self._futures.pop(oid)
-                if not fut.done():
-                    fut.set_result(obj)
-                continue
-            if "method" in obj and oid is not None:
-                # Server-to-client request (an approval elicitation that
-                # slipped past approval-policy=never). Refuse; never hang.
-                self._send_raw({"jsonrpc": "2.0", "id": oid,
-                                "error": {"code": -32600,
-                                          "message": "delegate sessions are non-interactive"}})
-                continue
-            params = obj.get("params") or {}
-            msg = params.get("msg")
-            if not isinstance(msg, dict):
-                continue
-            meta = params.get("_meta") or {}
-            rid = meta.get("requestId")
-            log = self._events.get(rid)
-            if log is not None:
-                log.feed(msg)
-            elif len(self._events) == 1:
-                # Codex occasionally omits requestId; with one active call
-                # the attribution is unambiguous.
-                next(iter(self._events.values())).feed(msg)
-        # Child died: fail whatever is still waiting so callers see a real
-        # error now instead of a timeout later.
-        for fut in self._futures.values():
-            if not fut.done():
-                fut.set_result({"error": {"message": "codex mcp-server exited unexpectedly"}})
-        self._futures.clear()
-
-    async def call(self, tool: str, arguments: dict[str, Any], timeout_s: int,
-                   events: _EventLog) -> dict[str, Any]:
-        import asyncio
-
-        await self._ensure_started()
-        assert self.proc is not None and self.proc.stdin is not None
-        fut = asyncio.get_running_loop().create_future()
-        call_id = self._send({"method": "tools/call",
-                              "params": {"name": tool, "arguments": arguments}})
-        self._futures[call_id] = fut
-        self._events[call_id] = events
-        try:
-            await self.proc.stdin.drain()
-            return await asyncio.wait_for(fut, timeout=timeout_s)
-        except asyncio.TimeoutError as exc:
-            raise AdapterError(
-                f"the delegated session exceeded {timeout_s}s and was "
-                "abandoned. Its worktree is removed, so nothing it does from "
-                "here on lands anywhere; retry with a smaller task or a "
-                "longer timeout_s."
-            ) from exc
-        finally:
-            self._futures.pop(call_id, None)
-            self._events.pop(call_id, None)
-
-
-_CHILD = _CodexChild()
-
-
-async def _run_codex_tool(
-    tool: str, arguments: dict[str, Any], timeout_s: int
-) -> tuple[str, str, _EventLog]:
-    """One tool call against the shared codex child.
-
-    Returns (result_text, thread_id, events).
-    """
-    events = _EventLog()
-    reply = await _CHILD.call(tool, arguments, timeout_s, events)
-
-    if "error" in reply:
-        raise AdapterError(_friendly_codex_error(str(reply["error"].get("message"))))
-    result = reply.get("result") or {}
-    text = "\n".join(
-        c.get("text", "") for c in result.get("content") or []
-        if isinstance(c, dict) and c.get("type") == "text"
-    ).strip()
-    structured = result.get("structuredContent") or {}
-    thread_id = str(structured.get("threadId") or structured.get("conversationId") or "")
-    if not text:
-        text = str(structured.get("content") or "")
-    if result.get("isError"):
-        low = text.lower()
-        if "session not found" in low:
-            raise AdapterError(
-                f"{text.strip()} -- delegated sessions live only as long as "
-                "this MCP server process. Start a fresh delegate call and "
-                "include the needed context in the task brief."
-            )
-        raise AdapterError(_friendly_codex_error(text or "; ".join(events.errors)))
-    return text or events.last_agent_message, thread_id, events
-
+def _toml(value: Any) -> str:
+    """A TOML literal for a -c override (strings, bools, lists, flat tables)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{json.dumps(str(k))} = {_toml(v)}" for k, v in value.items()) + "}"
+    return json.dumps(str(value))  # a JSON string is a valid TOML basic string
 
 
 _CHILD_CONFIG_CACHE: dict[str, Any] | None = None
@@ -338,21 +160,16 @@ def _child_config() -> dict[str, Any]:
     disabled: dict[str, dict[str, Any]] = {}
 
     def _entry(transport: dict[str, Any] | None) -> dict[str, Any] | None:
+        # Only what makes the definition valid: command or url, plus
+        # enabled=false. Never env, args or token variables -- these overrides
+        # travel on the codex command line, where `ps` can read them.
         if not isinstance(transport, dict):
             return None
         kind = transport.get("type")
         if kind == "stdio" and transport.get("command"):
-            out: dict[str, Any] = {"command": transport["command"], "enabled": False}
-            if transport.get("args"):
-                out["args"] = transport["args"]
-            if transport.get("env"):
-                out["env"] = transport["env"]
-            return out
+            return {"command": transport["command"], "enabled": False}
         if kind == "streamable_http" and transport.get("url"):
-            out = {"url": transport["url"], "enabled": False}
-            if transport.get("bearer_token_env_var"):
-                out["bearer_token_env_var"] = transport["bearer_token_env_var"]
-            return out
+            return {"url": transport["url"], "enabled": False}
         return None
 
     try:
@@ -385,54 +202,79 @@ def _child_config() -> dict[str, Any]:
     return _CHILD_CONFIG_CACHE
 
 
+def _mcp_disable_flags() -> list[str]:
+    flags: list[str] = []
+    for name, entry in (_child_config().get("mcp_servers") or {}).items():
+        if re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            flags += ["-c", f"mcp_servers.{name}={_toml(entry)}"]
+    return flags
+
 
 class CodexAdapter:
-    """Codex CLI via one persistent `codex mcp-server` child (see _CodexChild)."""
+    """Codex CLI in exec mode, one process per call."""
 
     name = "codex"
 
+    def _config(self, task: Task) -> list[str]:
+        sandbox = "workspace-write" if task.mode == "edit" else "read-only"
+        return ["-c", 'approval_policy="never"',
+                "-c", f"sandbox_mode={_toml(sandbox)}",
+                "-c", f"developer_instructions={_toml(task.brief)}",
+                *_mcp_disable_flags()]
+
+    def argv(self, task: Task, resume: str = "") -> list[str]:
+        model = ["-m", task.model] if task.model else []
+        if resume:
+            return ["codex", "exec", "resume", "--json", *self._config(task), *model,
+                    "--", resume, task.prompt]
+        sandbox = "workspace-write" if task.mode == "edit" else "read-only"
+        return ["codex", "exec", "--json", "-s", sandbox, "-C", str(task.cwd),
+                *self._config(task), *model, "--", task.prompt]
+
     async def run(self, task: Task) -> Result:
-        arguments: dict[str, Any] = {
-            "prompt": task.prompt,
-            "cwd": str(task.cwd),
-            "sandbox": "workspace-write" if task.mode == "edit" else "read-only",
-            "approval-policy": "never",
-            "developer-instructions": task.brief,
-            "config": _child_config(),
-        }
-        if task.model:
-            arguments["model"] = task.model
-        try:
-            text, thread_id, events = await _run_codex_tool("codex", arguments, task.timeout_s)
-        except AdapterError as exc:
-            exc.reason = _codex_reason(str(exc))
-            raise
-        return self._result(text, thread_id, events)
+        return await self._exec(task, "")
 
     async def reply(self, thread_id: str, task: Task) -> Result:
-        try:
-            text, thread_out, events = await _run_codex_tool(
-                "codex-reply", {"threadId": thread_id, "prompt": task.prompt}, task.timeout_s
-            )
-        except AdapterError as exc:
-            exc.reason = _codex_reason(str(exc))
-            raise
-        return self._result(text, thread_out, events)
+        return await self._exec(task, thread_id)
 
-    @staticmethod
-    def _result(text: str, thread_id: str, events: _EventLog) -> Result:
-        res = Result(text=text, thread_id=thread_id)
-        if events.tokens_reported:
-            res.prompt_tokens = events.prompt_tokens
-            res.completion_tokens = events.completion_tokens
-        leaked = events.mcp_servers_started - {"codex_apps"}
-        if leaked:
-            res.warnings.append(
-                "warning: child session started unexpected MCP servers: "
-                + ", ".join(sorted(leaked))
-            )
+    async def _exec(self, task: Task, resume: str) -> Result:
+        if shutil.which("codex") is None:
+            raise AdapterError("the `codex` CLI is not on PATH. Install Codex CLI and run "
+                               "`codex login`, then retry.", reason="cli-missing")
+        out, err, code = await _run_group(self.argv(task, resume), task, os.environ.copy())
+        res = Result(text="")
+        errors: list[str] = []
+        failed = False
+        for line in out.decode(errors="replace").splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = ev.get("type")
+            if kind == "thread.started":
+                res.thread_id = str(ev.get("thread_id") or "")
+            elif kind == "item.completed":
+                item = ev.get("item") or {}
+                if item.get("type") == "agent_message":
+                    res.text = str(item.get("text") or res.text)
+            elif kind == "turn.completed":
+                usage = ev.get("usage") or {}
+                if usage:
+                    res.prompt_tokens = (res.prompt_tokens or 0) + int(usage.get("input_tokens") or 0)
+                    res.completion_tokens = (res.completion_tokens or 0) + int(
+                        usage.get("output_tokens") or 0)
+            elif kind in ("turn.failed", "error"):
+                failed = True
+                detail = ev.get("error") if isinstance(ev.get("error"), dict) else ev
+                errors.append(str((detail or {}).get("message") or kind))
+        if code != 0 or failed:
+            tail = "; ".join(errors) or err.decode(errors="replace").strip()[-300:]
+            msg = _friendly_codex_error(tail or f"codex exited {code}")
+            if "no rollout found" in msg.lower():
+                msg += (" -- Codex has no session with that thread id. Start a fresh delegate "
+                        "call and include the needed context in the task brief.")
+            raise AdapterError(msg, reason=f"{_codex_reason(msg)}-exit-{code}", result=res)
         return res
-
 
 
 # --------------------------------------------------------------------------
@@ -525,30 +367,7 @@ class ClaudeAdapter:
         if shutil.which("claude") is None:
             raise AdapterError("the `claude` CLI is not on PATH. Install Claude Code and log "
                                "in once (`claude`), then retry.", reason="cli-missing")
-        proc = await asyncio.create_subprocess_exec(
-            *self.argv(task, resume),
-            cwd=str(task.cwd),
-            env=self.env(),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,  # its own process group, so a kill takes its children too
-        )
-        _CLAUDE_PROCS.add(proc.pid)
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=task.timeout_s)
-        except asyncio.TimeoutError as exc:
-            await _kill_group(proc)
-            raise AdapterError(
-                f"the delegated session exceeded {task.timeout_s}s and was stopped. Retry "
-                "with a smaller task or a longer timeout_s.", reason="timeout"
-            ) from exc
-        except asyncio.CancelledError:
-            await _kill_group(proc)
-            raise
-        finally:
-            _CLAUDE_PROCS.discard(proc.pid)
-        await _kill_group(proc)  # leader exited; reap anything it left in its group
+        out, err, returncode = await _run_group(self.argv(task, resume), task, self.env())
         data = _last_json(out.decode(errors="replace"))
         envelope = isinstance(data, dict) and data.get("type") == "result"
         res = Result(text="")
@@ -556,11 +375,11 @@ class ClaudeAdapter:
             _usage_into(res, data)
         if not envelope:
             detail = (err.decode(errors="replace") or out.decode(errors="replace")).strip()[-300:]
-            raise AdapterError(f"claude exited {proc.returncode} without a result: {detail}",
-                               reason=f"no-result-exit-{proc.returncode}")
-        if proc.returncode != 0 or data.get("is_error") or data.get("subtype") != "success":
+            raise AdapterError(f"claude exited {returncode} without a result: {detail}",
+                               reason=f"no-result-exit-{returncode}")
+        if returncode != 0 or data.get("is_error") or data.get("subtype") != "success":
             msg, reason = _claude_error(str(data.get("result") or data.get("subtype") or ""))
-            raise AdapterError(msg, reason=f"{reason}-exit-{proc.returncode}", result=res)
+            raise AdapterError(msg, reason=f"{reason}-exit-{returncode}", result=res)
         res.text = str(data.get("result") or "")
         res.thread_id = str(data.get("session_id") or "")
         denials = data.get("permission_denials") or []
@@ -630,26 +449,59 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
-_CLAUDE_PROCS: set[int] = set()
+_AGENT_GROUPS: set[int] = set()
+
+
+async def _run_group(argv: list[str], task: Task, env: dict[str, str]) -> tuple[bytes, bytes, int]:
+    """Run one agent CLI in its own process group, in the task's directory.
+
+    Whatever happens -- normal exit, timeout, cancellation -- the whole group
+    is gone when this returns or raises, so nothing keeps working in a
+    worktree that is about to be removed.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv, cwd=str(task.cwd), env=env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    _AGENT_GROUPS.add(proc.pid)
+    if task.agent_record is not None:
+        try:
+            started = subprocess.run(["ps", "-o", "lstart=", "-p", str(proc.pid)],
+                                     capture_output=True, text=True, timeout=10).stdout.strip()
+            with task.agent_record.open("a") as fh:
+                fh.write(json.dumps({"pgid": proc.pid, "started": started}) + "\n")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=task.timeout_s)
+    except asyncio.TimeoutError as exc:
+        await _kill_group(proc)
+        raise AdapterError(
+            f"the delegated session exceeded {task.timeout_s}s and was stopped (its whole "
+            "process group is gone). Retry with a smaller task or a longer timeout_s.",
+            reason="timeout") from exc
+    except asyncio.CancelledError:
+        await _kill_group(proc)
+        raise
+    finally:
+        _AGENT_GROUPS.discard(proc.pid)
+    await _kill_group(proc)  # the leader exited; reap anything it left in its group
+    return out, err, proc.returncode if proc.returncode is not None else -1
 
 
 def kill_all_children() -> None:
-    """Synchronously kill every agent CLI this process started. For shutdown
-    paths (signal handler, atexit), where awaiting is not an option."""
-    for pgid in list(_CLAUDE_PROCS):
+    """Synchronously kill every agent CLI process group this process started.
+    For shutdown paths (signal handler, atexit), where awaiting is not an option."""
+    for pgid in list(_AGENT_GROUPS):
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(pgid, sig)
             except (ProcessLookupError, PermissionError):
                 break
-    _CLAUDE_PROCS.clear()
-    child = _CHILD.proc
-    if child is not None and child.returncode is None:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(child.pid, sig)
-            except (ProcessLookupError, PermissionError):
-                break
+    _AGENT_GROUPS.clear()
 
 
 ADAPTERS: dict[str, Any] = {"codex": CodexAdapter(), "claude": ClaudeAdapter()}
