@@ -55,6 +55,8 @@ __all__ = [
     "log_usage",
     "read_usage",
     "otel_enabled",
+    "otel_status",
+    "otel_flush",
     "delegate_span",
     "DELEGATE_ADAPTERS",
     "DELEGATE_MODELS",
@@ -793,13 +795,15 @@ def log_usage(**record: Any) -> None:
     if record.get("route") == "frontier" and record.get("tool") in OTEL_SPAN_TOOLS:
         try:
             if otel_enabled():
-                export_delegate_span(record)
+                _otel_enqueue(record)
         except Exception as exc:  # noqa: BLE001 -- telemetry must never break a call
-            _otel_failed(str(exc))
+            _otel_failed(f"internal error ({type(exc).__name__})")
 
 
 # --------------------------------------------------------------------------
-# OpenTelemetry: one span per delegated task, built from its journal row.
+# OpenTelemetry: one span per delegated-task invocation, built from its journal
+# row. A delegate call and its delegate_reply follow-ups share one trace (the
+# trace id is derived from the task id), each as its own span.
 #
 # Off by default; `otel_traces: true` in config/harness.yaml turns it on. Spans
 # go out as OTLP/HTTP JSON (stdlib only, no SDK) to the standard endpoint
@@ -808,24 +812,42 @@ def log_usage(**record: Any) -> None:
 # headers from OTEL_EXPORTER_OTLP_TRACES_HEADERS / OTEL_EXPORTER_OTLP_HEADERS;
 # service.name from OTEL_SERVICE_NAME (default agent-harness). Encoding per the
 # OTLP spec: hex trace/span ids, int64 as decimal strings, enums as integers.
-# An export failure is loud -- stderr once per process, plus a journal row --
-# and never fails the delegated call.
+#
+# Export runs on one background thread, so a slow collector never blocks a
+# delegated call or the MCP server's event loop; pending spans get a short
+# grace period at exit. Redirects are refused (they would carry the headers to
+# another host) and headers are only ever sent over https or to loopback. A
+# failure -- unreachable, HTTP error, spans rejected in partialSuccess -- is
+# loud: one stderr line per process plus an otel-export journal row, with a
+# fixed category and the endpoint's scheme://host:port only.
 # --------------------------------------------------------------------------
 
 OTEL_CONFIG_KEY = "otel_traces"
 OTEL_SPAN_TOOLS = ("delegate", "delegate_reply")
 OTEL_DEFAULT_ENDPOINT = "http://127.0.0.1:4318"
 OTEL_TIMEOUT_S = 3.0
+OTEL_EXIT_GRACE_S = 2.0
 _OTEL_WARNED = False
+_OTEL_QUEUE: Any = None
+_OTEL_LOCK = __import__("threading").Lock()
+
+
+def otel_status(cfg: "Config | None" = None) -> tuple[bool, str]:
+    """(enabled, problem). An explicit null or a non-boolean is a problem, not a silent off."""
+    cfg = cfg or load_config(required=False)
+    if OTEL_CONFIG_KEY not in cfg.raw:
+        return False, ""
+    value = cfg.raw.get(OTEL_CONFIG_KEY)
+    if not isinstance(value, bool):
+        return False, f"{OTEL_CONFIG_KEY} must be true or false, not {value!r}; treating it as off"
+    return value, ""
 
 
 def otel_enabled(cfg: "Config | None" = None) -> bool:
-    cfg = cfg or load_config(required=False)
-    value = cfg.raw.get(OTEL_CONFIG_KEY)
-    if value is not None and not isinstance(value, bool):
-        _otel_failed(f"{OTEL_CONFIG_KEY} must be true or false, not {value!r}; treating it as off")
-        return False
-    return value is True
+    enabled, problem = otel_status(cfg)
+    if problem:
+        _otel_failed(problem)
+    return enabled
 
 
 def otel_traces_url() -> str:
@@ -834,6 +856,15 @@ def otel_traces_url() -> str:
         return explicit
     base = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or OTEL_DEFAULT_ENDPOINT
     return base.rstrip("/") + "/v1/traces"
+
+
+def otel_endpoint_label(url: str | None = None) -> str:
+    """scheme://host:port only -- never a path, query or userinfo, which can hold secrets."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url or otel_traces_url())
+    host = parts.hostname or "?"
+    return f"{parts.scheme}://{host}" + (f":{parts.port}" if parts.port else "")
 
 
 def _otel_headers() -> dict[str, str]:
@@ -861,9 +892,12 @@ def _attr(key: str, value: Any) -> dict[str, Any]:
 
 def delegate_span(record: dict[str, Any], end_ns: int | None = None) -> dict[str, Any]:
     """The OTLP/JSON ExportTraceServiceRequest for one delegated-task row."""
+    import hashlib
+
     end_ns = end_ns or time.time_ns()
     start_ns = end_ns - int(record.get("duration_ms") or 0) * 1_000_000
     ok = bool(record.get("ok"))
+    task_id = str(record.get("task_id") or "")
     attrs = [
         _attr("delegate.role", record.get("role") or ""),
         _attr("delegate.adapter", record.get("adapter") or record.get("alias") or ""),
@@ -872,6 +906,8 @@ def delegate_span(record: dict[str, Any], end_ns: int | None = None) -> dict[str
         _attr("delegate.duration_ms", int(record.get("duration_ms") or 0)),
         _attr("delegate.tokens_reported", record.get("prompt_tokens") is not None),
     ]
+    if task_id:
+        attrs.append(_attr("delegate.task_id", task_id))
     if record.get("prompt_tokens") is not None:
         attrs.append(_attr("gen_ai.usage.input_tokens", int(record["prompt_tokens"])))
         attrs.append(_attr("gen_ai.usage.output_tokens", int(record.get("completion_tokens") or 0)))
@@ -880,8 +916,11 @@ def delegate_span(record: dict[str, Any], end_ns: int | None = None) -> dict[str
     if not ok and record.get("detail"):
         attrs.append(_attr("delegate.error_reason", record["detail"]))
     status = {"code": 1} if ok else {"code": 2, "message": str(record.get("detail") or "error")}
+    # One trace per task: the first call and every follow-up land together.
+    trace_id = (hashlib.sha256(task_id.encode()).hexdigest()[:32] if task_id
+                else os.urandom(16).hex())
     span = {
-        "traceId": os.urandom(16).hex(),
+        "traceId": trace_id,
         "spanId": os.urandom(8).hex(),
         "name": str(record.get("tool")),
         "kind": 1,  # SPAN_KIND_INTERNAL
@@ -897,28 +936,95 @@ def delegate_span(record: dict[str, Any], end_ns: int | None = None) -> dict[str
     }]}
 
 
-def export_delegate_span(record: dict[str, Any]) -> None:
-    body = json.dumps(delegate_span(record)).encode()
-    req = urllib.request.Request(
-        otel_traces_url(), data=body, method="POST",
-        headers={"Content-Type": "application/json", **_otel_headers()},
-    )
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:  # noqa: D102
+        return None  # a 3xx becomes an HTTPError instead of resending headers elsewhere
+
+
+def export_delegate_span(record: dict[str, Any], end_ns: int | None = None) -> None:
+    """Send one span now (the worker thread calls this). Raises HarnessError with
+    a fixed category and the sanitized endpoint; never echoes a header value."""
+    from urllib.parse import urlsplit
+
+    url = otel_traces_url()
+    label = otel_endpoint_label(url)
+    headers = _otel_headers()
+    host = urlsplit(url).hostname or ""
+    if headers and urlsplit(url).scheme != "https" and host not in ("127.0.0.1", "localhost", "::1"):
+        raise HarnessError(f"refusing to send OTLP headers over plain http to {label}; use https")
+    body = json.dumps(delegate_span(record, end_ns)).encode()
     try:
-        with urllib.request.urlopen(req, timeout=OTEL_TIMEOUT_S) as resp:
-            if resp.status >= 300:
-                raise HarnessError(f"collector answered HTTP {resp.status}")
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json", **headers})
+    except ValueError as exc:
+        raise HarnessError(f"invalid OTLP endpoint or headers for {label}") from exc
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=OTEL_TIMEOUT_S) as resp:
+            reply = resp.read(65536)
     except urllib.error.HTTPError as exc:
-        raise HarnessError(f"collector answered HTTP {exc.code}") from exc
+        raise HarnessError(f"collector at {label} answered HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
-        raise HarnessError(f"cannot reach {otel_traces_url()} ({exc.reason})") from exc
+        raise HarnessError(f"cannot reach collector at {label}") from exc
+    except (OSError, ValueError) as exc:
+        raise HarnessError(f"export to {label} failed ({type(exc).__name__})") from exc
+    try:
+        partial = (json.loads(reply or b"{}") or {}).get("partialSuccess") or {}
+    except (ValueError, AttributeError):
+        partial = {}
+    rejected = int(partial.get("rejectedSpans") or 0) if isinstance(partial, dict) else 0
+    if rejected:
+        raise HarnessError(f"collector at {label} rejected {rejected} span(s)")
+
+
+def _otel_worker() -> None:
+    while True:
+        item = _OTEL_QUEUE.get()
+        if item is None:
+            return
+        record, end_ns = item
+        try:
+            export_delegate_span(record, end_ns)
+        except HarnessError as exc:
+            _otel_failed(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            _otel_failed(f"internal error ({type(exc).__name__})")
+        finally:
+            _OTEL_QUEUE.task_done()
+
+
+def _otel_enqueue(record: dict[str, Any]) -> None:
+    global _OTEL_QUEUE
+    import atexit
+    import queue
+    import threading
+
+    with _OTEL_LOCK:
+        if _OTEL_QUEUE is None:
+            _OTEL_QUEUE = queue.Queue()
+            threading.Thread(target=_otel_worker, name="otel-export", daemon=True).start()
+            atexit.register(otel_flush)
+    _OTEL_QUEUE.put((dict(record), time.time_ns()))
+
+
+def otel_flush(timeout: float = OTEL_EXIT_GRACE_S) -> None:
+    """Wait up to ``timeout`` for queued spans to go out (exit path, tests)."""
+    if _OTEL_QUEUE is None:
+        return
+    deadline = time.time() + timeout
+    while _OTEL_QUEUE.unfinished_tasks and time.time() < deadline:
+        time.sleep(0.05)
 
 
 def _otel_failed(message: str) -> None:
     global _OTEL_WARNED
     if not _OTEL_WARNED:
         _OTEL_WARNED = True
-        warn(f"otel: span export failed -- {message}. The journal row was written; "
-             f"set {OTEL_CONFIG_KEY}: false in config/harness.yaml to stop exporting.")
+        try:
+            warn(f"otel: span export failed -- {message}. The journal row was written; "
+                 f"set {OTEL_CONFIG_KEY}: false in config/harness.yaml to stop exporting.")
+        except Exception:  # noqa: BLE001 -- a broken stderr must not break the call
+            pass
     log_usage(tool="otel-export", route="local", ok=False, detail=message[:200])
 
 
