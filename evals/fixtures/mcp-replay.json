@@ -1,0 +1,505 @@
+{
+  "delegate": {
+    "calls": [
+      {
+        "arguments": {
+          "model": "local-big",
+          "repo": "demo",
+          "task": "anything"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: 'local-big' is a local harness alias; delegate always runs on the frontier Codex model. For local work use the offload tools."
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "repo": "no-such-repo",
+          "task": "anything"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: repo 'no-such-repo' is not in config/repos.yaml. Delegation is scoped to configured repos only. Available: demo."
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "mode": "review",
+          "repo": "demo",
+          "task": "Explain hello.py"
+        },
+        "result": {
+          "isError": false,
+          "structuredContent": {
+            "result": "fake codex: done in read-only sandbox\n\n--- read-only session; no edits were possible ---\n\nthreadId: thread-1  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 34 out]"
+          },
+          "text": [
+            "fake codex: done in read-only sandbox\n\n--- read-only session; no edits were possible ---\n\nthreadId: thread-1  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 34 out]"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "mode": "edit",
+          "repo": "demo",
+          "task": "Add a note file"
+        },
+        "result": {
+          "isError": false,
+          "structuredContent": {
+            "result": "fake codex: done in workspace-write sandbox\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-2.md\n\nthreadId: thread-2  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 34 out]"
+          },
+          "text": [
+            "fake codex: done in workspace-write sandbox\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-2.md\n\nthreadId: thread-2  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 34 out]"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "prompt": "and one more",
+          "thread_id": {
+            "$from": 3
+          }
+        },
+        "result": {
+          "isError": false,
+          "structuredContent": {
+            "result": "fake codex: replied on thread-2\n\nthreadId: thread-2\n\n[frontier spend logged to usage journal -- tokens: 300 in / 12 out]"
+          },
+          "text": [
+            "fake codex: replied on thread-2\n\nthreadId: thread-2\n\n[frontier spend logged to usage journal -- tokens: 300 in / 12 out]"
+          ]
+        },
+        "tool": "delegate_reply"
+      },
+      {
+        "arguments": {
+          "prompt": "hello?",
+          "thread_id": "thread-unknown"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate_reply: Session not found for thread_id -- delegated sessions live only as long as this MCP server process. Start a fresh delegate call and include the needed context in the task brief."
+          ]
+        },
+        "tool": "delegate_reply"
+      }
+    ],
+    "initialize": {
+      "capabilities": [
+        "experimental",
+        "prompts",
+        "resources",
+        "tools"
+      ],
+      "instructions": "Frontier delegation for this workspace. Two tools:\n\n* delegate       -- hand one scoped task to a Codex session in ONE repo\n* delegate_reply -- continue a previous delegated session by threadId\n\nThis is metered frontier capacity on the user's OpenAI subscription, not the\nfree local rung. Delegate deliberately and say what you are delegating and\nwhy; never route work here just because it is available. Good fits: working\ntwo repos in parallel (you keep one, Codex takes the other), a second model's\nopinion on a cross-repo contract, overflow when you are context- or\nrate-limited. Every call is logged to the usage journal as frontier spend.",
+      "name": "harness-delegate"
+    },
+    "tools": [
+      {
+        "annotations": {
+          "readOnlyHint": false,
+          "title": "Delegate a task to Codex"
+        },
+        "description": "Hand one scoped task to a frontier Codex session in a single repo.\n\nMetered frontier capacity on the user's OpenAI subscription -- delegate\ndeliberately, and say in the conversation what you are delegating and why.\nGood fits: parallel multi-repo work (you keep one repo, Codex takes the\nother), a second model's read on a cross-repo contract, or overflow when\nyou are context- or rate-limited. Bad fits: anything a local offload tool\nalready covers (compress_context / workspace_search / draft), or work you\nhave not scoped tightly enough to review as a diff afterwards.\n\nIn edit mode the target repo must have no modified tracked files; the\nresult includes the session's report, a diff summary, and a threadId for\ndelegate_reply follow-ups.\n",
+        "inputSchema": {
+          "properties": {
+            "mode": {
+              "default": "edit",
+              "description": "edit: Codex may modify the working tree (requires clean tracked files; diff summary returned). review: read-only -- second opinions, audits, explanations.",
+              "enum": [
+                "edit",
+                "review"
+              ],
+              "title": "Mode",
+              "type": "string"
+            },
+            "model": {
+              "default": "",
+              "description": "Optional Codex model override (e.g. a specific gpt-5.x id). Default: the user's own Codex default. Never a harness local alias -- this tool is the frontier rung by definition.",
+              "title": "Model",
+              "type": "string"
+            },
+            "repo": {
+              "description": "Name of the target repo exactly as listed in config/repos.yaml. The session is confined to that checkout. Delegating repo B while you work repo A is the intended split.",
+              "title": "Repo",
+              "type": "string"
+            },
+            "task": {
+              "description": "The complete task brief: goal, constraints, and how to verify. Codex sees nothing of the parent conversation, so include everything it needs -- contract details, file hints, acceptance criteria.",
+              "title": "Task",
+              "type": "string"
+            },
+            "timeout_s": {
+              "default": 1200,
+              "description": "Seconds to allow the session before abandoning it.",
+              "maximum": 3600,
+              "minimum": 60,
+              "title": "Timeout S",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "task",
+            "repo"
+          ],
+          "title": "delegateArguments",
+          "type": "object"
+        },
+        "name": "delegate",
+        "outputSchema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "delegateOutput",
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "readOnlyHint": false,
+          "title": "Continue a delegated session"
+        },
+        "description": "Continue an existing delegated Codex session with its context intact.\n\nCheaper and more coherent than starting a fresh delegate call when the\nfollow-up concerns the same task. The session keeps the same repo scoping\nand sandbox it was started with.\n",
+        "inputSchema": {
+          "properties": {
+            "prompt": {
+              "description": "Follow-up instruction for that session: corrections, next step, or a request to finish something it left incomplete.",
+              "title": "Prompt",
+              "type": "string"
+            },
+            "thread_id": {
+              "description": "The threadId returned by a previous delegate call.",
+              "title": "Thread Id",
+              "type": "string"
+            },
+            "timeout_s": {
+              "default": 1200,
+              "maximum": 3600,
+              "minimum": 60,
+              "title": "Timeout S",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "thread_id",
+            "prompt"
+          ],
+          "title": "delegate_replyArguments",
+          "type": "object"
+        },
+        "name": "delegate_reply",
+        "outputSchema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "delegate_replyOutput",
+          "type": "object"
+        }
+      }
+    ]
+  },
+  "offload": {
+    "calls": [
+      {
+        "arguments": {
+          "text": "ERROR: build failed\n  at src/app.py:12\nexit 2\n"
+        },
+        "result": {
+          "isError": false,
+          "structuredContent": {
+            "result": "[fake local-big reply 02f7dceee3ec]\n\n_compressed 45 -> 35 chars (1.3x) via local-big in 1 pass(es)_"
+          },
+          "text": [
+            "[fake local-big reply 02f7dceee3ec]\n\n_compressed 45 -> 35 chars (1.3x) via local-big in 1 pass(es)_"
+          ]
+        },
+        "tool": "compress_context"
+      },
+      {
+        "arguments": {},
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool compress_context: pass exactly one of `text` or `path`."
+          ]
+        },
+        "tool": "compress_context"
+      },
+      {
+        "arguments": {
+          "context": "diff --git a/hello.py b/hello.py\n+print('hi')\n",
+          "kind": "commit"
+        },
+        "result": {
+          "isError": false,
+          "structuredContent": {
+            "result": "[fake local-fast reply c344221aa1d3]"
+          },
+          "text": [
+            "[fake local-fast reply c344221aa1d3]"
+          ]
+        },
+        "tool": "draft"
+      },
+      {
+        "arguments": {
+          "context": "   ",
+          "kind": "pr"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool draft: `context` is empty -- paste the diff, log, or source to draft from."
+          ]
+        },
+        "tool": "draft"
+      },
+      {
+        "arguments": {
+          "limit": 3,
+          "query": "greeting function"
+        },
+        "result": {
+          "isError": false,
+          "log_messages": [
+            "refreshing workspace index (no index yet)",
+            "index: scanning demo",
+            "index: demo: 2 file(s) (re)indexed",
+            "index: 2 file(s), 2 chunk(s) embedded in <T>s (0 unchanged/skipped)"
+          ],
+          "structuredContent": {
+            "result": "2 match(es) for 'greeting function' across 1 repo(s):\n\n## demo\n\n`demo/hello.py:1-3`  (score 0.229)\n```\ndef greet(name):\n    \"\"\"Return a greeting.\"\"\"\n    return f\"hello {name}\"\n```\n\n`demo/README.md:1-3`  (score -0.119)\n```\n# demo\n\nA one-file repo for replay checks.\n```"
+          },
+          "text": [
+            "2 match(es) for 'greeting function' across 1 repo(s):\n\n## demo\n\n`demo/hello.py:1-3`  (score 0.229)\n```\ndef greet(name):\n    \"\"\"Return a greeting.\"\"\"\n    return f\"hello {name}\"\n```\n\n`demo/README.md:1-3`  (score -0.119)\n```\n# demo\n\nA one-file repo for replay checks.\n```"
+          ]
+        },
+        "tool": "workspace_search"
+      }
+    ],
+    "initialize": {
+      "capabilities": [
+        "experimental",
+        "prompts",
+        "resources",
+        "tools"
+      ],
+      "instructions": "Local-model offload for this workspace. Three tools:\n\n* compress_context -- read something large without spending context on it\n* workspace_search -- find code across every repo in the workspace by meaning\n* draft            -- produce a commit message, PR body, changelog or test skeleton\n\nAll three run against local models through a LiteLLM proxy on localhost. They\ncost nothing but wall-clock time, so prefer them over doing the same work\ninline. If the proxy is down every tool says so and names the fix.",
+      "name": "harness-offload"
+    },
+    "tools": [
+      {
+        "annotations": {
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Compress bulky machine output into a short factual brief BEFORE you read it.\n\nReach for this whenever the thing you are about to read is large and mostly\nnoise: CI or build logs, a failing test run, `git diff` of a big change, a\ndependency audit, a long design doc or RFC, a verbose stack trace. Passing a\n50k-line log through here costs you ~400 words of context instead of the\nwhole file, and the work happens on a local model at no token cost.\n\nError messages, file paths, line numbers, failing test names and stack frame\nordering are preserved verbatim, so the brief is safe to act on directly:\nthe citations in it are real. Set `focus` to the question you actually need\nanswered -- an unfocused summary of a build log is much weaker than one\ntold to explain a specific failure.\n\nDo NOT use it when you need the exact full text (a patch you must apply, a\nfile you are about to edit) -- read those directly. Oversized input is\nsummarised section by section and merged, so very large files take longer\nrather than failing.\n",
+        "inputSchema": {
+          "properties": {
+            "focus": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "What the brief must answer, e.g. 'why does the auth test fail' or 'which public APIs changed'. Sharpens the summary considerably.",
+              "title": "Focus"
+            },
+            "max_words": {
+              "default": 400,
+              "description": "Approximate word budget for the brief.",
+              "maximum": 2000,
+              "minimum": 50,
+              "title": "Max Words",
+              "type": "integer"
+            },
+            "path": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "File to read and compress instead of inline `text`.",
+              "title": "Path"
+            },
+            "text": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Raw material to compress. Use this or `path`.",
+              "title": "Text"
+            }
+          },
+          "title": "compress_contextArguments",
+          "type": "object"
+        },
+        "name": "compress_context",
+        "outputSchema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "compress_contextOutput",
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Write the boilerplate prose or scaffolding you would otherwise type yourself.\n\nUse it for the last mile of a change: a commit message from a diff, a PR\nbody from the commit log, changelog entries from a release range, a test\nskeleton for a function you just wrote. It runs on the small fast local\nmodel, so it returns quickly and costs no tokens -- there is no reason to\ncompose these by hand.\n\nFeed it real material (`git diff --staged`, `git log`, the function source)\nrather than a description of the material; the quality of the draft tracks\nthe quality of the context almost exactly. Pass `style` when the project has\nconventions worth honouring.\n\nThe output is the artifact alone, with no preamble, so it can be piped\nstraight into `git commit -F -` or a PR body. Always review it before it\nbecomes permanent -- a local model can misread intent behind a diff, and\ndrafted tests are skeletons to fill in, not verified assertions.\n",
+        "inputSchema": {
+          "properties": {
+            "context": {
+              "description": "Everything the writer needs: the diff, the commit log, the issue text, the function under test. More context, better draft.",
+              "title": "Context",
+              "type": "string"
+            },
+            "kind": {
+              "description": "Which artifact to write.",
+              "enum": [
+                "commit",
+                "pr",
+                "changelog",
+                "test"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "style": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Project conventions to follow, e.g. 'conventional commits', 'pytest, no mocks', 'past tense, ticket id in subject'.",
+              "title": "Style"
+            }
+          },
+          "required": [
+            "kind",
+            "context"
+          ],
+          "title": "draftArguments",
+          "type": "object"
+        },
+        "name": "draft",
+        "outputSchema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "draftOutput",
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Semantic search across EVERY repo in the workspace, not just the open one.\n\nThis is the right first move whenever a question spans repositories or you\ndo not know which repo owns the answer: \"who calls this endpoint\", \"where\nelse do we parse this config\", \"what is the blast radius of changing this\nfield\". Results are grouped by repo precisely so cross-repo impact is\nvisible at a glance -- three repos in the result list means three repos to\ncheck before you ship.\n\nIt ranks by meaning (embeddings) and boosts exact literal matches, so it\nfinds the concept when you don't know the identifier, and the identifier\nwhen you do. Returns `path:start-end` citations with snippets; read the\ncited ranges directly for anything you intend to change.\n\nPrefer plain Grep/Glob when you already know the exact symbol AND the repo\n-- that is faster. Prefer this when the question is conceptual or the scope\nis the whole workspace. The index is built on first use and refreshed\nincrementally when files change, so the first call after a big sync can\ntake a few minutes; progress is reported as it goes.\n",
+        "inputSchema": {
+          "properties": {
+            "limit": {
+              "default": 10,
+              "description": "Maximum citations to return.",
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            },
+            "query": {
+              "description": "What you are looking for, in words or as an identifier: 'where do we refresh the auth token', 'RetryPolicy', 'callers of publish_event'.",
+              "title": "Query",
+              "type": "string"
+            },
+            "repo": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Restrict to one repo by directory name. Omit to search all.",
+              "title": "Repo"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "title": "workspace_searchArguments",
+          "type": "object"
+        },
+        "name": "workspace_search",
+        "outputSchema": {
+          "properties": {
+            "result": {
+              "title": "Result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "title": "workspace_searchOutput",
+          "type": "object"
+        }
+      }
+    ]
+  }
+}

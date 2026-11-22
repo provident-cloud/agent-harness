@@ -17,3 +17,11 @@ checks:
       A team, org, product or person name lands in a tracked file of this
       public repo (path or content), including launchd labels.
     timeout: 60
+
+  - id: mcp-replay
+    run: python3 -I "$HARNESS_ROOT/evals/checks/mcp_replay.py" --require-mcp-major 2
+    trap: >
+      An mcp SDK upgrade (or a port to a new SDK API) silently changes what
+      the offload/delegate servers expose: tool names, schemas, error text,
+      progress messages. Also fails unless both PEP-723 headers pin mcp 2.x.
+    timeout: 600
