@@ -136,8 +136,12 @@ it sends `io.modelcontextprotocol/logLevel` (e.g. `info`) in the request's
 (the CLI's own default). A concrete model id is refused, so is a local alias,
 so is an alias with no mapping for that adapter -- the error lists the ones that
 work. `bin/local delegate-check` shows the configured pair and which alias runs
-where; `bin/local health` runs the same check. Map more aliases per team in
-`config/tier-overrides.yaml` under `delegate_models:`.
+where; `bin/local health` runs the same check, including that the CLI is new
+enough (Claude Code 2.1.259+). Map more aliases per team in
+`config/tier-overrides.yaml` under `delegate_models:`. The `claude` adapter
+bills your subscription login: it drops `ANTHROPIC_API_KEY` from the child
+unless `delegate: {allow_api_key: true}`. It runs `--restricted`, so it edits
+but never runs commands -- pick `codex` when the task needs tests run.
 
 ## Choosing a tool
 
