@@ -500,6 +500,12 @@ def run_check(check: dict[str, Any], target: Path, run_dir: Path) -> dict[str, A
         result.update(status="skipped", reason=clip(tail or "check cannot run here", 160))
     else:
         result.update(status="fail", reason=clip(f"exit {code}: {tail}", 160))
+    if result["status"] != "pass":
+        # The summary line is one clipped sentence; in CI the transcript file is
+        # gone with the runner. Put the tail on stderr where a log keeps it.
+        h.warn(f"{check_id}: {result['status']} -- last lines of its output:")
+        for line in output.splitlines()[-40:]:
+            h.info(f"    {line}")
     return result
 
 
