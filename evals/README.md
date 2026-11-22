@@ -51,7 +51,9 @@ you have work in progress.
 `evals/checks.yaml` holds checks of the harness itself, not of an agent: a
 command, an exit code, no judge. `bin/eval --checks-only` runs only those and
 needs no proxy, so they are safe for CI. Exit 0 passes, 77 skips (the check
-cannot run on this machine), anything else fails. `bin/eval --checks-only --rev
+cannot run on this machine), anything else fails. Under `--strict` a self-check
+that skips or is disabled fails too, so CI cannot go green on a check that never
+ran. `bin/eval --checks-only --rev
 <ref>` runs the current checks against a detached worktree of the harness at
 `<ref>` -- the before half of before/after for a harness change.
 

@@ -14,7 +14,9 @@ this repository. The only worked example here is fictional (`examples/acme/`).
 `bin/eval --checks-only` runs the `no-org-names` self-check: it fails on any
 denylisted name in a tracked file's path or content. The tracked denylist is
 hashed (`evals/checks/name-denylist.sha256`) so it does not publish the names
-itself. Run it before every PR.
+in plain text -- that is not secrecy, a guess can be confirmed against a hash, so
+a name that must stay confidential goes only in `config/name-denylist.txt`. Run
+it before every PR.
 
 Owner is still tweaking — prefer small commits over sweeping refactors.
 
