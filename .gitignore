@@ -8,11 +8,11 @@
 config/
 !examples/acme/config/
 
-# Team instantiation: the answers file and the workspace context for a specific
-# team. Untracked on purpose -- this repo is the generic core, and a real team's
-# repo names, org, and product details must never land in it. The files stay on
-# disk; move them between machines out of band (private gist, password manager,
-# scp), not through this repository.
+# Team instantiation (answers file, name denylist) now lives in config/ above:
+# config/answers.yaml, config/name-denylist.txt. This older location stays
+# ignored so a checkout that still has it cannot commit it by accident. Move
+# these files between machines out of band (private gist, password manager,
+# scp), never through this repository.
 instantiation/
 
 # Runtime state: logs, PID file, the usage journal.
