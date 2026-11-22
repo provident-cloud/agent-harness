@@ -89,6 +89,30 @@ all route `local-big` to the hosted endpoint — and it keeps working, which is 
 problem. It shows up here before it shows up on an invoice. `--by-tool` breaks it
 down per tool and alias; `--days N` or `--since DATE` sets the window.
 
+## Before you open a PR on the harness itself
+
+```sh
+bin/eval --checks-only --strict      # deterministic self-checks, no proxy needed
+```
+
+These are `evals/checks.yaml`: no agent, no judge, a few seconds. One of them,
+`no-org-names`, fails if a team, org, product or person name appears in a
+tracked file's path or content (read from git's index, so a staged name counts).
+Under `--strict` a self-check that skips or is disabled also fails. Your own team's names go in
+`config/name-denylist.txt` (gitignored, one per line) and are checked too.
+`--rev <ref>` runs today's checks against an older tree, which is how a new
+check proves it fails without its change.
+
+**Launchd labels were renamed** to `local.agent-harness.litellm` and
+`local.agent-harness.watch.<name>`. A machine that installed either agent under
+the previous label gets a `warn` from `bin/litellm-agent status` and
+`bin/issue-watch list`. Re-run `bin/litellm-agent install`, and `bin/issue-watch
+install` per watch **with the same `--name`, `--script` and `--interval`**
+(`plutil -p` on the old plist shows them; a different name would leave the old
+watch running beside the new one). Install unloads the old job, waits until
+launchd confirms it is gone, then deletes its plist; if it will not unload,
+install stops and changes nothing.
+
 ## Choosing a tool
 
 A decision list, not a feature tour.

@@ -34,7 +34,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>sh.adviser.harness.watch.__WATCH_NAME__</string>
+  <string>local.agent-harness.watch.__WATCH_NAME__</string>
 
   <key>ProgramArguments</key>
   <array>

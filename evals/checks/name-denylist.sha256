@@ -1,0 +1,13 @@
+# SHA-256 of lower-cased names that must never appear in a tracked file.
+# Format: <sha256> <token|substr> <length>. Hashed so the list itself does not
+# publish the names. Add one: printf %s name | shasum -a 256. Team-only additions
+# go in plain text in gitignored config/name-denylist.txt instead.
+# Read by evals/checks/no-names.py.
+233c3c2c59623ae7c874780aff9c3fb710d2436dd64e1fa7cc6dad39c94baf04 token 7
+7d9f026a488b459d3c52d1cd0686e042b45eddc021a01568ea5accfb1a04a4e1 token 11
+3a9ea6efcfc7874c771506906f0c276891d9dbb7c3e319c09fcd96f6cadf6497 substr 9
+2ff6212e5040d0050c274f324ce03614b01647f08eeb824bb6c6b0362559665e substr 11
+d8e61b17a03e864389fbbd0f4bfa8853b42323d124a3352cb5724662d1a8b883 substr 7
+0984d34c44f4b5849c10e7bd19abc86a01ca905974b829ea3a20742e4070e684 substr 9
+6f9edcd3408cbda14a837e6a44fc5b7f64ccc9a2477c1498fcb13c777ffb9605 token 4
+8813536d83193565cebfb524df1e6f80fe5a8e17e3fa3b27ad31a09c9aea0fc8 substr 6

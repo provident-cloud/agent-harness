@@ -46,7 +46,18 @@ Every run happens in a detached `git worktree` under `var/`, removed afterwards.
 Your working tree, index and branch are untouched, so it is safe to run while
 you have work in progress.
 
-## Why this is not in CI
+## Self-checks: the deterministic exception
+
+`evals/checks.yaml` holds checks of the harness itself, not of an agent: a
+command, an exit code, no judge. `bin/eval --checks-only` runs only those and
+needs no proxy, so they are safe for CI. Exit 0 passes, 77 skips (the check
+cannot run on this machine), anything else fails. Under `--strict` a self-check
+that skips or is disabled fails too, so CI cannot go green on a check that never
+ran. `bin/eval --checks-only --rev
+<ref>` runs the current checks against a detached worktree of the harness at
+`<ref>` -- the before half of before/after for a harness change.
+
+## Why agent cases are not in CI
 
 - It is slow and non-deterministic. The agent is a language model, so is the
   judge; two runs of the same case can legitimately disagree at the margin.

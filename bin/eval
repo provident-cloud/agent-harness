@@ -23,6 +23,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import harness_lib as h
 
 CASES_FILE = "evals/cases.yaml"
+# Harness self-checks: deterministic, no agent, no judge, no proxy. Kept out of
+# cases.yaml on purpose -- that file is per-team stumbles and ships empty.
+CHECKS_FILE = "evals/checks.yaml"
+# A check script exits 77 to say "cannot run here" (missing tool, no network).
+CHECK_SKIP_CODE = 77
 
 # One agent invocation per case. Placeholders are substituted before the string
 # is split with shlex, so a task containing quotes stays a single argument.
@@ -120,6 +125,27 @@ def load_cases() -> list[dict[str, Any]]:
     if dupes:
         raise h.HarnessError(f"{CASES_FILE}: duplicate case id(s): {', '.join(dupes)}")
     return out
+
+
+def load_checks() -> list[dict[str, Any]]:
+    """Entries from evals/checks.yaml, tagged kind=check. Empty if absent."""
+    path = h.harness_root() / CHECKS_FILE
+    if not path.exists():
+        return []
+    data = h.load_yaml(path, default={}) or {}
+    checks = data.get("checks") or [] if isinstance(data, dict) else None
+    if not isinstance(checks, list):
+        raise h.HarnessError(f"{CHECKS_FILE}: `checks:` must be a list")
+    out: list[dict[str, Any]] = []
+    for index, check in enumerate(checks):
+        if not isinstance(check, dict) or not check.get("id") or not check.get("run"):
+            raise h.HarnessError(f"{CHECKS_FILE}: check #{index + 1} needs `id` and `run`")
+        out.append({**check, "kind": "check"})
+    return out
+
+
+def is_check(case: dict[str, Any]) -> bool:
+    return case.get("kind") == "check"
 
 
 def select(cases: list[dict[str, Any]], case_id: str | None, pattern: str | None) -> list[dict]:
@@ -437,19 +463,92 @@ def run_case(case: dict[str, Any], cfg: h.Config, run_dir: Path) -> dict[str, An
         )
 
 
+def run_check(check: dict[str, Any], target: Path, run_dir: Path) -> dict[str, Any]:
+    """Run one deterministic self-check. Exit 0 pass, 77 skipped, else fail.
+
+    ``run`` is a bash command executed with the target tree as cwd. The check
+    scripts themselves always come from the current harness checkout (exposed as
+    $HARNESS_ROOT), so `--rev <old>` asks "would today's checks pass on that
+    tree?" -- which is how a check proves it fails without its change.
+    """
+    check_id = str(check["id"])
+    result: dict[str, Any] = {
+        "id": check_id, "kind": "check", "repo": "(harness)", "commit": "",
+        "trap": check.get("trap"), "status": "fail", "reason": "",
+        "answers": {}, "duration_s": 0.0, "transcript": None,
+    }
+    if check.get("enabled") is False:
+        result.update(status="skipped", reason="disabled in checks.yaml")
+        return result
+    env = dict(os.environ)
+    env["HARNESS_ROOT"] = str(h.harness_root())
+    env["HARNESS_EVAL_TARGET"] = str(target)
+    env["HARNESS_EVAL_CASE"] = check_id
+    env["HARNESS_NO_USAGE_LOG"] = "1"  # a self-check is not spend
+    timeout = int(check.get("timeout") or DEFAULT_TIMEOUT)
+    h.step(f"{check_id}: {check['run']}")
+    code, output, duration = run_command(["bash", "-c", str(check["run"])], target, timeout, env)
+    result["duration_s"] = round(duration, 1)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_path = run_dir / f"{check_id}.check.txt"
+    out_path.write_text(output, errors="replace")
+    result["transcript"] = str(out_path)
+    tail = next((ln for ln in reversed(output.splitlines()) if ln.strip()), "")
+    if code == 0:
+        result["status"] = "pass"
+    elif code == CHECK_SKIP_CODE:
+        result.update(status="skipped", reason=clip(tail or "check cannot run here", 160))
+    else:
+        result.update(status="fail", reason=clip(f"exit {code}: {tail}", 160))
+    if result["status"] != "pass":
+        # The summary line is one clipped sentence; in CI the transcript file is
+        # gone with the runner. Put the tail on stderr where a log keeps it.
+        h.warn(f"{check_id}: {result['status']} -- last lines of its output:")
+        for line in output.splitlines()[-40:]:
+            h.info(f"    {line}")
+    return result
+
+
+class _RevTree:
+    """A detached worktree of the harness at REV, removed on exit."""
+
+    def __init__(self, rev: str, run_dir: Path) -> None:
+        self.rev = rev
+        self.path = run_dir / "harness-at-rev"
+        self.root = h.harness_root()
+
+    def __enter__(self) -> Path:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        add = subprocess.run(
+            ["git", "-C", str(self.root), "worktree", "add", "--detach", "--force",
+             str(self.path), self.rev],
+            capture_output=True, text=True,
+        )
+        if add.returncode != 0:
+            raise h.HarnessError(f"--rev {self.rev}: {clip(add.stderr or add.stdout, 200)}")
+        return self.path
+
+    def __exit__(self, *_exc: object) -> None:
+        subprocess.run(["git", "-C", str(self.root), "worktree", "remove", "--force",
+                        str(self.path)], capture_output=True, text=True)
+        shutil.rmtree(self.path, ignore_errors=True)
+        subprocess.run(["git", "-C", str(self.root), "worktree", "prune"],
+                       capture_output=True, text=True)
+
+
 # --------------------------------------------------------------------------
 # Output
 # --------------------------------------------------------------------------
 
 
 def print_list(cases: list[dict[str, Any]]) -> None:
-    print(_b(f"{len(cases)} case(s) in {CASES_FILE}"))
+    print(_b(f"{len(cases)} case(s) in {CASES_FILE} and {CHECKS_FILE}"))
     table(
         ["id", "repo", "commit", "trap"],
         [
             [
                 str(c["id"]),
-                clip(c.get("repo") or "-", 28),
+                clip(c.get("repo") or ("(harness check)" if is_check(c) else "-"), 28),
                 clip(case_commit(c)[:12] or "-", 12),
                 clip(c.get("trap") or "-", 60),
             ]
@@ -465,6 +564,12 @@ def print_dry_run(cases: list[dict[str, Any]], cfg: h.Config, run_dir: Path) -> 
     print(_d("  judge            local-big"))
     for case in cases:
         case_id = str(case["id"])
+        if is_check(case):
+            print()
+            print(_b(f"  {case_id}  (self-check: no agent, no judge)"))
+            print(f"    run       {case['run']}")
+            print(f"    cwd       {h.harness_root()}  (or the --rev worktree)")
+            continue
         repo, why = resolve_repo(case, cfg)
         print()
         print(_b(f"  {case_id}"))
@@ -499,7 +604,8 @@ def print_summary(results: list[dict[str, Any]], run_dir: Path) -> None:
                 r["id"],
                 r["status"],
                 f"{r['duration_s']:.0f}",
-                clip(r["reason"] or "all four checks passed", 64),
+                clip(r["reason"] or ("check passed" if r.get("kind") == "check"
+                                     else "all four checks passed"), 64),
             ]
             for r in results
         ],
@@ -539,6 +645,12 @@ local-big grades each transcript on the four questions:
   bin/eval --case api-migrations  one case
   bin/eval --filter 'auth|db'     regex over case id and repo
   bin/eval --json                 machine-readable results
+  bin/eval --checks-only          only the deterministic self-checks
+  bin/eval --checks-only --rev origin/main   today's checks against an older tree
+
+Self-checks ({CHECKS_FILE}) are the exception to "not for CI": no agent, no
+judge, no proxy. Each runs a command; exit 0 passes, 77 skips, anything else
+fails.
 
 NOT FOR CI. Runs are slow, need real checkouts and a running LiteLLM proxy, and
 the judge is a language model -- its verdicts are informative, not gating. Run
@@ -552,16 +664,32 @@ is 0 regardless of verdicts unless you pass --strict.
     parser.add_argument("--dry-run", action="store_true", help="show what would run; change nothing")
     parser.add_argument("--json", action="store_true", help="emit results as JSON on stdout")
     parser.add_argument(
-        "--strict", action="store_true", help="exit non-zero if any case fails or is inconclusive"
+        "--strict", action="store_true",
+        help="exit non-zero if any case fails or is inconclusive, or any self-check does not pass"
+    )
+    parser.add_argument(
+        "--checks-only", action="store_true",
+        help=f"run only the deterministic self-checks in {CHECKS_FILE} (no proxy needed)",
+    )
+    parser.add_argument(
+        "--rev", metavar="REV",
+        help="run self-checks against a detached worktree of the harness at REV "
+             "(proves a check fails without its change)",
     )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    cases = load_cases()
+    checks = load_checks()
+    cases = [] if args.checks_only else load_cases()
+    if args.rev and not args.checks_only:
+        raise h.HarnessError("--rev applies to self-checks only; add --checks-only")
 
-    if not cases:
+    if args.checks_only and args.strict and not checks:
+        raise h.HarnessError(f"--checks-only --strict: no checks in {CHECKS_FILE}; refusing to pass")
+
+    if not cases and not checks:
         message = (
             "no cases yet, which is the expected state for a fresh harness; a case is "
             "born the first time an agent stumbles on something real. See evals/README.md."
@@ -581,7 +709,12 @@ def main(argv: list[str] | None = None) -> int:
             print(_d("  See evals/README.md."))
         return 0
 
-    selected = select(cases, args.case, args.filter)
+    ids = [c["id"] for c in cases + checks]
+    clash = sorted({i for i in ids if ids.count(i) > 1})
+    if clash:
+        raise h.HarnessError(f"id(s) used in both {CASES_FILE} and {CHECKS_FILE}: {clash}")
+
+    selected = select(cases + checks, args.case, args.filter)
     if not selected:
         h.warn("no cases matched the filter")
         return 0
@@ -590,8 +723,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             json.dump(
                 [
-                    {"id": c["id"], "repo": c.get("repo"), "commit": case_commit(c),
-                     "trap": c.get("trap")}
+                    {"id": c["id"], "kind": c.get("kind", "case"), "repo": c.get("repo"),
+                     "commit": case_commit(c), "trap": c.get("trap")}
                     for c in selected
                 ],
                 sys.stdout,
@@ -610,16 +743,25 @@ def main(argv: list[str] | None = None) -> int:
         print_dry_run(selected, cfg, run_dir)
         return 0
 
-    if not h.litellm_up(cfg):
+    agent_cases = [c for c in selected if not is_check(c)]
+    self_checks = [c for c in selected if is_check(c)]
+    if agent_cases and not h.litellm_up(cfg):
         raise h.HarnessError(
             f"LiteLLM is not answering at {cfg.base_url}, so local-big cannot judge "
-            "anything. Start the proxy with `./setup.sh --start` and re-run."
+            "anything. Start the proxy with `./setup.sh --start` and re-run, or pass "
+            "--checks-only to run just the deterministic self-checks."
         )
 
     run_dir.mkdir(parents=True, exist_ok=True)
     results = []
     try:
-        for case in selected:
+        if self_checks:
+            if args.rev:
+                with _RevTree(args.rev, run_dir) as target:
+                    results.extend(run_check(c, target, run_dir) for c in self_checks)
+            else:
+                results.extend(run_check(c, h.harness_root(), run_dir) for c in self_checks)
+        for case in agent_cases:
             results.append(run_case(case, cfg, run_dir))
     except KeyboardInterrupt:
         h.warn("interrupted; worktrees for finished cases were cleaned up")
@@ -628,6 +770,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(
             {
                 "run_dir": str(run_dir),
+                "rev": args.rev,
                 "results": results,
                 "counts": {s: sum(1 for r in results if r["status"] == s) for s in STATUS_ORDER},
             },
@@ -640,6 +783,12 @@ def main(argv: list[str] | None = None) -> int:
         print_summary(results, run_dir)
 
     if args.strict and any(r["status"] in ("fail", "inconclusive") for r in results):
+        return 1
+    # A self-check is deterministic, so under --strict anything short of a pass
+    # (skipped, disabled) is a failure: CI must not go green on a check that
+    # never ran. Agent cases keep their old rule -- a missing checkout skips.
+    if args.strict and any(r.get("kind") == "check" and r["status"] != "pass" for r in results):
+        h.error("--strict: a self-check did not pass (skipped or disabled counts)")
         return 1
     return 0
 
