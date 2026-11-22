@@ -162,6 +162,35 @@ branch cannot be written, the call fails and the edits are saved to
 committed code only -- commit first if it needs your latest change. The worktree is removed however the task ends; if the server was
 SIGKILLed, the next start removes it and says so on stderr.
 
+**Delegated tasks can emit OpenTelemetry spans.** Off by default. One key turns
+it on:
+
+```yaml
+# config/harness.yaml
+otel_traces: true
+```
+
+Each delegated task (`delegate`, `delegate_reply`) then sends one span, built
+from its usage-journal row, as OTLP/HTTP JSON to
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, else `$OTEL_EXPORTER_OTLP_ENDPOINT/v1/traces`,
+else `http://127.0.0.1:4318/v1/traces` (headers from `OTEL_EXPORTER_OTLP_HEADERS`).
+Set those in the environment the MCP server starts in. Attributes:
+`delegate.role` (the optional `role` argument, default the mode),
+`delegate.adapter`, `delegate.model_alias` (never the concrete model),
+`gen_ai.usage.input_tokens` / `output_tokens`, `delegate.cost_usd` when the CLI
+reports it, `delegate.duration_ms`, `delegate.outcome` and, on failure,
+`delegate.error_reason` with span status ERROR, and `delegate.task_id`. A
+`delegate_reply` follow-up is its own span in the same trace as its task. A
+cancelled call is recorded too (`cancelled`).
+
+Export runs on a background thread, so a slow or dead collector never holds up
+a task: you get one `warn otel: span export failed` on stderr and an
+`otel-export` row in the journal (also when the collector answers 200 but
+rejects the span). Redirects are refused, and OTLP headers are only sent over
+https or to loopback. The agent CLIs never see the OTLP header variables.
+`bin/local delegate-check` (and `--json`) shows whether export is on and where
+it sends; `otel_traces: null` or any non-boolean is reported as a problem.
+
 ## Choosing a tool
 
 A decision list, not a feature tour.
