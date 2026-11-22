@@ -755,6 +755,11 @@ def delegate_report(quiet: bool) -> tuple[dict, list[str]]:
         problems.append(f"delegate config: {problem}")
     if cli_problem:
         problems.append(f"delegate CLI: {cli_problem}")
+    otel_on, otel_problem = h.otel_status()
+    report["otel"] = {"enabled": otel_on, "endpoint": h.otel_endpoint_label(),
+                      "problem": otel_problem}
+    if otel_problem:
+        problems.append(f"otel: {otel_problem}")
     if not quiet:
         h.step("delegation")
         if problem:
@@ -764,8 +769,10 @@ def delegate_report(quiet: bool) -> tuple[dict, list[str]]:
             h.ok(f"adapter {adapter} + model {alias}")
         for a, adapters in report["aliases"].items():
             h.info(f"  {a.ljust(20)} runs on: {', '.join(adapters) or '(nothing)'}")
-        if h.otel_enabled():
-            h.ok(f"otel traces on -> {h.otel_traces_url()} (one span per delegated task)")
+        if otel_problem:
+            h.error(f"otel: {otel_problem}")
+        elif otel_on:
+            h.ok(f"otel traces on -> {h.otel_endpoint_label()} (one span per delegated task)")
         else:
             h.info(f"  otel traces off (set {h.OTEL_CONFIG_KEY}: true in config/harness.yaml)")
         if cli and not on_path:

@@ -452,6 +452,12 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
 _AGENT_GROUPS: set[int] = set()
 
 
+def _scrub(env: dict[str, str]) -> dict[str, str]:
+    """Drop the harness's own telemetry credentials before an agent CLI sees them."""
+    return {k: v for k, v in env.items()
+            if not (k.startswith("OTEL_EXPORTER_OTLP") and k.endswith("HEADERS"))}
+
+
 async def _run_group(argv: list[str], task: Task, env: dict[str, str]) -> tuple[bytes, bytes, int]:
     """Run one agent CLI in its own process group, in the task's directory.
 
@@ -460,7 +466,7 @@ async def _run_group(argv: list[str], task: Task, env: dict[str, str]) -> tuple[
     worktree that is about to be removed.
     """
     proc = await asyncio.create_subprocess_exec(
-        *argv, cwd=str(task.cwd), env=env,
+        *argv, cwd=str(task.cwd), env=_scrub(env),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

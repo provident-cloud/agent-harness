@@ -36,6 +36,7 @@ Launched from arbitrary working directories, so the harness root comes from
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import os
 import signal
@@ -221,7 +222,7 @@ _THREADS: dict[str, dict[str, Any]] = {}
 
 def _log_delegate(tool: str, *, adapter: str, alias: str, concrete: str | None, ok: bool,
                   started: float, result: Result | None, reason: str = "",
-                  role: str = "") -> None:
+                  role: str = "", task_id: str = "") -> None:
     """One journal row. ``reason`` is a fixed failure category, never CLI text:
     error messages can quote anything a CLI printed, and the journal is on disk."""
     record: dict[str, Any] = dict(
@@ -229,6 +230,7 @@ def _log_delegate(tool: str, *, adapter: str, alias: str, concrete: str | None, 
         alias=adapter,  # usage-report groups by this; it was always the CLI name
         adapter=adapter,
         role=role,
+        task_id=task_id,
         model_alias=alias,
         model_resolved=concrete or f"{adapter}-default",
         route="frontier",
@@ -352,10 +354,17 @@ async def delegate(
         started = time.time()
         try:
             result = await ADAPTERS[adapter_name].run(job)
+        except asyncio.CancelledError:
+            # The client cancelled: the agent is already stopped (adapters kill
+            # its group). Journal the outcome once, then let the cancel through.
+            _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
+                          ok=False, started=started, result=None, reason="cancelled",
+                          role=role, task_id=lease.task_id)
+            raise
         except AdapterError as exc:
             _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
                           ok=False, started=started, result=exc.result, reason=exc.reason,
-                          role=role)
+                          role=role, task_id=lease.task_id)
             raise ToolError(str(exc)) from exc
 
         parts = [result.text or f"({adapter_name} returned no final message)"]
@@ -364,12 +373,13 @@ async def delegate(
                 parts.append(_take_changes(lease, f"adapter: {adapter_name}, model alias: {alias}"))
             except HandoffError as exc:
                 _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
-                              ok=False, started=started, result=result, reason="handoff-failed", role=role)
+                              ok=False, started=started, result=result, reason="handoff-failed", role=role,
+                              task_id=lease.task_id)
                 raise ToolError(f"{exc}\n\n--- the session's own report ---\n{parts[0]}") from exc
         else:
             parts.append("--- read-only session; no edits were possible ---")
         _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
-                      ok=True, started=started, result=result, role=role)
+                      ok=True, started=started, result=result, role=role, task_id=lease.task_id)
         if result.thread_id:
             _THREADS[result.thread_id] = {
                 "adapter": adapter_name, "alias": alias, "concrete": concrete,
@@ -434,9 +444,12 @@ async def delegate_reply(
                    agent_record=wt.agent_record(lease))
         started = time.time()
         log = dict(adapter=adapter_name, alias=known["alias"], concrete=known["concrete"],
-                   started=started, role=known["role"])
+                   started=started, role=known["role"], task_id=known["task_id"])
         try:
             result = await ADAPTERS[adapter_name].reply(thread_id, job)
+        except asyncio.CancelledError:
+            _log_delegate("delegate_reply", ok=False, result=None, reason="cancelled", **log)
+            raise
         except AdapterError as exc:
             _log_delegate("delegate_reply", ok=False, result=exc.result, reason=exc.reason, **log)
             raise ToolError(str(exc)) from exc
@@ -479,6 +492,7 @@ def _shutdown(signum: int, _frame: object) -> None:  # noqa: D401
     kill_all_children()
     wt.kill_inflight_git()
     wt.release_all()
+    h.otel_flush(1.0)  # os._exit skips atexit; give queued spans a moment
     os._exit(128 + signum)
 
 
