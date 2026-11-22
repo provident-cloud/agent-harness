@@ -59,6 +59,7 @@ __all__ = [
     "delegate_models",
     "delegate_settings",
     "delegate_combo_problem",
+    "delegate_cli_problem",
     "read_input",
     "chunk_text",
     "info",
@@ -149,6 +150,10 @@ DELEGATE_MODELS: dict[str, dict[str, str | None]] = {
     "frontier-fast": {"claude": "sonnet"},
 }
 
+# Oldest CLI version whose flags the adapter uses (claude: --permission-prompts
+# arrived in 2.1.259). Checked by delegate-check, health and before each call.
+DELEGATE_CLI_MIN: dict[str, tuple[int, ...]] = {"claude": (2, 1, 259)}
+
 DEFAULT_DELEGATE_ADAPTER = "codex"
 DEFAULT_DELEGATE_MODEL = "frontier-default"
 
@@ -165,8 +170,12 @@ def delegate_models(overrides_path: Path | None = None) -> dict[str, dict[str, s
         for alias, per in extra.items():
             if not isinstance(per, dict):
                 raise HarnessError(f"{path}: delegate_models.{alias} must map adapter -> model")
+            for a, m in per.items():
+                if m is not None and not isinstance(m, str):
+                    raise HarnessError(f"{path}: delegate_models.{alias}.{a} must be a model "
+                                       f"string or null (the CLI default), not {type(m).__name__}")
             models.setdefault(str(alias), {}).update(
-                {str(a): (None if m in (None, "", "default") else str(m)) for a, m in per.items()}
+                {str(a): (None if m in (None, "", "default") else m) for a, m in per.items()}
             )
     return models
 
@@ -195,11 +204,47 @@ def delegate_combo_problem(adapter: str, alias: str,
 def delegate_settings(cfg: "Config | None" = None) -> tuple[str, str]:
     """(adapter, model alias) configured in config/harness.yaml ``delegate:``."""
     cfg = cfg or load_config(required=False)
-    section = cfg.raw.get("delegate") or {}
+    section = cfg.raw.get("delegate")
+    if section is None:
+        section = {}
     if not isinstance(section, dict):
         raise HarnessError("config/harness.yaml: `delegate:` must be a mapping")
-    return (str(section.get("adapter") or DEFAULT_DELEGATE_ADAPTER),
-            str(section.get("model") or DEFAULT_DELEGATE_MODEL))
+    out = []
+    for key, default in (("adapter", DEFAULT_DELEGATE_ADAPTER), ("model", DEFAULT_DELEGATE_MODEL)):
+        if key not in section or section[key] is None:
+            out.append(default)
+        elif isinstance(section[key], str) and section[key].strip():
+            out.append(section[key].strip())
+        else:
+            raise HarnessError(f"config/harness.yaml: delegate.{key} must be a non-empty string, "
+                               f"not {section[key]!r}")
+    return out[0], out[1]
+
+
+def delegate_cli_problem(adapter: str) -> str:
+    """Why the adapter's CLI cannot run here (missing, too old), or ""."""
+    import shutil as _shutil
+
+    cli = DELEGATE_CLIS.get(adapter, "")
+    if not cli or _shutil.which(cli) is None:
+        return f"`{cli or adapter}` is not on PATH"
+    need = DELEGATE_CLI_MIN.get(adapter)
+    if not need:
+        return ""
+    try:
+        out = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"`{cli} --version` failed: {exc}"
+    import re as _re
+
+    m = _re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
+    if not m:
+        return f"could not read a version from `{cli} --version` ({(out or '').strip()[:60]!r})"
+    have = tuple(int(x) for x in m.groups())
+    if have < need:
+        return (f"{cli} {'.'.join(map(str, have))} is older than {'.'.join(map(str, need))}, "
+                f"the oldest the {adapter} adapter supports -- update it")
+    return ""
 
 
 DEFAULT_PORT = 4000

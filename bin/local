@@ -747,11 +747,14 @@ def delegate_report(quiet: bool) -> tuple[dict, list[str]]:
         adapter, alias, models, problem = "?", "?", {}, str(exc)
     cli = h.DELEGATE_CLIS.get(adapter, "")
     on_path = bool(cli and shutil.which(cli))
+    cli_problem = h.delegate_cli_problem(adapter) if on_path else ""
     report = {"adapter": adapter, "model_alias": alias, "cli": cli, "cli_on_path": on_path,
-              "problem": problem,
+              "problem": problem, "cli_problem": cli_problem,
               "aliases": {a: sorted(per) for a, per in sorted(models.items())}}
     if problem:
         problems.append(f"delegate config: {problem}")
+    if cli_problem:
+        problems.append(f"delegate CLI: {cli_problem}")
     if not quiet:
         h.step("delegation")
         if problem:
@@ -763,6 +766,8 @@ def delegate_report(quiet: bool) -> tuple[dict, list[str]]:
             h.info(f"  {a.ljust(20)} runs on: {', '.join(adapters) or '(nothing)'}")
         if cli and not on_path:
             h.warn(f"`{cli}` is not on PATH -- delegate calls will fail until it is installed")
+        elif cli_problem:
+            h.error(f"{cli}: {cli_problem}")
     return report, problems
 
 
