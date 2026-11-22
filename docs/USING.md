@@ -149,13 +149,17 @@ and run two delegated tasks on the same repo at once. An edit task's changes
 come back on a `delegate/<task-id>` branch, named in the result:
 
 ```sh
-git diff <base>..delegate/<task-id>     # review
-git merge --ff-only delegate/<task-id>  # take it (or cherry-pick)
-git branch -D delegate/<task-id>        # or drop it
+git diff <base>..delegate/<task-id>                 # review
+git switch --detach delegate/<task-id> && <checks>  # test: no hooks ran on it
+git merge --ff-only delegate/<task-id>              # take it (or cherry-pick)
+git branch -D delegate/<task-id>                    # or drop it
 ```
 
-The delegate sees committed code only -- commit first if it needs your latest
-change. The worktree is removed however the task ends; if the server was
+No repo hooks run on the harness's checkout or commit, and a fast-forward runs
+none either -- run the repo's checks on the branch before you take it. If the
+branch cannot be written, the call fails and the edits are saved to
+`var/delegate-patches/<task-id>.patch` (`git apply` it). The delegate sees
+committed code only -- commit first if it needs your latest change. The worktree is removed however the task ends; if the server was
 SIGKILLed, the next start removes it and says so on stderr.
 
 ## Choosing a tool

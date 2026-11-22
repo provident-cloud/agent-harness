@@ -42,7 +42,7 @@ is the changelog. Beyond the original design:
   SDK bump.
 
 Hard-won facts live in code comments where they matter (reasoning models return
-empty strings; Codex MCP quirks in `mcp/delegate-server/server.py`; the cache-hit
+empty strings; Codex/Claude CLI notes in `mcp/delegate-server/adapters.py`; the cache-hit
 discriminator in `lib/harness_lib.py`). Trust those comments — each one was
 measured, not assumed.
 
