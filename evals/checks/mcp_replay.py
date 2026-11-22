@@ -221,6 +221,9 @@ def normalise(value: Any, subs: list[tuple[str, str]]) -> Any:
         for old, new in subs:
             value = value.replace(old, new)
         # Durations are wall-clock; everything else must be byte-stable.
+        # workspace_search scores include a literal-match boost that depends on
+        # whether ripgrep is installed; the ranking and snippets still count.
+        value = re.sub(r"\(score -?\d+\.\d+\)", "(score <S>)", value)
         return re.sub(r"\b\d+(\.\d+)?s\b", "<T>s", value)
     if isinstance(value, list):
         return [normalise(v, subs) for v in value]

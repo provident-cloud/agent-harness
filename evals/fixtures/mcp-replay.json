@@ -314,10 +314,10 @@
             }
           ],
           "structuredContent": {
-            "result": "2 match(es) for 'greeting function' across 1 repo(s):\n\n## demo\n\n`demo/hello.py:1-3`  (score 0.229)\n```\ndef greet(name):\n    \"\"\"Return a greeting.\"\"\"\n    return f\"hello {name}\"\n```\n\n`demo/README.md:1-3`  (score -0.119)\n```\n# demo\n\nA one-file repo for replay checks.\n```"
+            "result": "2 match(es) for 'greeting function' across 1 repo(s):\n\n## demo\n\n`demo/hello.py:1-3`  (score <S>)\n```\ndef greet(name):\n    \"\"\"Return a greeting.\"\"\"\n    return f\"hello {name}\"\n```\n\n`demo/README.md:1-3`  (score <S>)\n```\n# demo\n\nA one-file repo for replay checks.\n```"
           },
           "text": [
-            "2 match(es) for 'greeting function' across 1 repo(s):\n\n## demo\n\n`demo/hello.py:1-3`  (score 0.229)\n```\ndef greet(name):\n    \"\"\"Return a greeting.\"\"\"\n    return f\"hello {name}\"\n```\n\n`demo/README.md:1-3`  (score -0.119)\n```\n# demo\n\nA one-file repo for replay checks.\n```"
+            "2 match(es) for 'greeting function' across 1 repo(s):\n\n## demo\n\n`demo/hello.py:1-3`  (score <S>)\n```\ndef greet(name):\n    \"\"\"Return a greeting.\"\"\"\n    return f\"hello {name}\"\n```\n\n`demo/README.md:1-3`  (score <S>)\n```\n# demo\n\nA one-file repo for replay checks.\n```"
           ]
         },
         "tool": "workspace_search"
