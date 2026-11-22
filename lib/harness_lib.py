@@ -54,6 +54,12 @@ __all__ = [
     "litellm_up",
     "log_usage",
     "read_usage",
+    "DELEGATE_ADAPTERS",
+    "DELEGATE_MODELS",
+    "delegate_models",
+    "delegate_settings",
+    "delegate_combo_problem",
+    "delegate_cli_problem",
     "read_input",
     "chunk_text",
     "info",
@@ -117,6 +123,129 @@ DEFAULT_MODELS: dict[str, dict[str, str]] = {
         "keep_alive": "10m",
     },
 }
+
+# --------------------------------------------------------------------------
+# Delegation: which agent CLI runs a delegated task, on which model alias.
+#
+# Same contract as the local aliases: nothing outside this file (and
+# config/tier-overrides.yaml) names a concrete model. A delegate model alias
+# maps, per adapter, to the value passed to that CLI's --model flag; None means
+# "pass no --model": the CLI's own configured default. An alias with no entry
+# for an adapter cannot run on it, and delegate_combo_problem() says so.
+# --------------------------------------------------------------------------
+
+DELEGATE_ADAPTERS = ("codex", "claude")
+
+# Which executable each adapter drives. The server checks it is on PATH.
+DELEGATE_CLIS: dict[str, str] = {"codex": "codex", "claude": "claude"}
+
+DELEGATE_MODELS: dict[str, dict[str, str | None]] = {
+    # The CLI's own default model -- whatever `codex` / `claude` is set to use.
+    "frontier-default": {"codex": None, "claude": None},
+    # Claude Code accepts these short names and resolves them to the latest
+    # model in that family itself. Codex has no equivalent stable short names,
+    # so these aliases are claude-only until a team maps them in
+    # config/tier-overrides.yaml under `delegate_models:`.
+    "frontier-deep": {"claude": "opus"},
+    "frontier-fast": {"claude": "sonnet"},
+}
+
+# Oldest CLI version whose flags the adapter uses (claude: --permission-prompts
+# arrived in 2.1.259). Checked by delegate-check, health and before each call.
+DELEGATE_CLI_MIN: dict[str, tuple[int, ...]] = {"claude": (2, 1, 259)}
+
+DEFAULT_DELEGATE_ADAPTER = "codex"
+DEFAULT_DELEGATE_MODEL = "frontier-default"
+
+
+def delegate_models(overrides_path: Path | None = None) -> dict[str, dict[str, str | None]]:
+    """DELEGATE_MODELS with ``delegate_models:`` from config/tier-overrides.yaml merged in."""
+    models = {alias: dict(per) for alias, per in DELEGATE_MODELS.items()}
+    path = overrides_path or (config_dir() / "tier-overrides.yaml")
+    if path.exists():
+        data = load_yaml(path, default={}) or {}
+        extra = data.get("delegate_models") or {}
+        if not isinstance(extra, dict):
+            raise HarnessError(f"{path}: `delegate_models:` must be a mapping of alias -> adapter -> model")
+        for alias, per in extra.items():
+            if not isinstance(per, dict):
+                raise HarnessError(f"{path}: delegate_models.{alias} must map adapter -> model")
+            for a, m in per.items():
+                if m is not None and not isinstance(m, str):
+                    raise HarnessError(f"{path}: delegate_models.{alias}.{a} must be a model "
+                                       f"string or null (the CLI default), not {type(m).__name__}")
+            models.setdefault(str(alias), {}).update(
+                {str(a): (None if m in (None, "", "default") else m) for a, m in per.items()}
+            )
+    return models
+
+
+def delegate_combo_problem(adapter: str, alias: str,
+                           models: dict[str, dict[str, str | None]] | None = None) -> str:
+    """Why ``adapter`` cannot run ``alias``, or "" when the pair works."""
+    models = models if models is not None else delegate_models()
+    if adapter not in DELEGATE_ADAPTERS:
+        return f"unknown delegate adapter {adapter!r}; expected one of {', '.join(DELEGATE_ADAPTERS)}"
+    if alias in ALIASES or alias == REMOTE_ALIAS:
+        return (f"{alias!r} is a local harness alias; delegation is the frontier rung and "
+                f"never runs on local models. Use one of: {', '.join(sorted(models))}")
+    if alias not in models:
+        return (f"{alias!r} is not a delegate model alias. Use one of: {', '.join(sorted(models))} "
+                "(concrete model names are mapped in lib/harness_lib.py or "
+                "config/tier-overrides.yaml `delegate_models:`, never passed directly)")
+    if adapter not in models[alias]:
+        works = sorted(a for a in models if adapter in models[a])
+        return (f"adapter {adapter!r} has no model mapped for {alias!r}. With {adapter} use: "
+                f"{', '.join(works)}; or map one in config/tier-overrides.yaml "
+                f"`delegate_models: {{{alias}: {{{adapter}: <model>}}}}`")
+    return ""
+
+
+def delegate_settings(cfg: "Config | None" = None) -> tuple[str, str]:
+    """(adapter, model alias) configured in config/harness.yaml ``delegate:``."""
+    cfg = cfg or load_config(required=False)
+    section = cfg.raw.get("delegate")
+    if section is None:
+        section = {}
+    if not isinstance(section, dict):
+        raise HarnessError("config/harness.yaml: `delegate:` must be a mapping")
+    out = []
+    for key, default in (("adapter", DEFAULT_DELEGATE_ADAPTER), ("model", DEFAULT_DELEGATE_MODEL)):
+        if key not in section or section[key] is None:
+            out.append(default)
+        elif isinstance(section[key], str) and section[key].strip():
+            out.append(section[key].strip())
+        else:
+            raise HarnessError(f"config/harness.yaml: delegate.{key} must be a non-empty string, "
+                               f"not {section[key]!r}")
+    return out[0], out[1]
+
+
+def delegate_cli_problem(adapter: str) -> str:
+    """Why the adapter's CLI cannot run here (missing, too old), or ""."""
+    import shutil as _shutil
+
+    cli = DELEGATE_CLIS.get(adapter, "")
+    if not cli or _shutil.which(cli) is None:
+        return f"`{cli or adapter}` is not on PATH"
+    need = DELEGATE_CLI_MIN.get(adapter)
+    if not need:
+        return ""
+    try:
+        out = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"`{cli} --version` failed: {exc}"
+    import re as _re
+
+    m = _re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
+    if not m:
+        return f"could not read a version from `{cli} --version` ({(out or '').strip()[:60]!r})"
+    have = tuple(int(x) for x in m.groups())
+    if have < need:
+        return (f"{cli} {'.'.join(map(str, have))} is older than {'.'.join(map(str, need))}, "
+                f"the oldest the {adapter} adapter supports -- update it")
+    return ""
+
 
 DEFAULT_PORT = 4000
 DEFAULT_HOST = "127.0.0.1"

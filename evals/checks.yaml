@@ -33,3 +33,17 @@ checks:
       offload server, or progress behaves differently from what USING.md says
       (spec: log messages only for requests that opt in).
     timeout: 600
+  - id: delegate-config
+    run: bash "$HARNESS_ROOT/evals/checks/delegate_config.sh"
+    trap: >
+      A delegate adapter is configured with a model alias it cannot run (a
+      local alias, a concrete model name, an alias with no mapping for that
+      CLI) and nothing says so until a delegated call fails mid-session.
+    timeout: 300
+
+  - id: kill-group
+    run: python3 -I "$HARNESS_ROOT/evals/checks/kill_group.py"
+    trap: >
+      A delegated CLI is stopped (timeout, cancel) but a descendant it started
+      keeps running because only the leader was checked.
+    timeout: 120

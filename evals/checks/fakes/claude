@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""A stand-in for the Claude Code CLI, for replay checks. Canned replies only.
+
+Covers what mcp/delegate-server/adapters.py ClaudeAdapter runs:
+
+    claude -p --output-format json --restricted --permission-mode acceptEdits|plan
+           --permission-prompts none --strict-mcp-config
+           --append-system-prompt <brief> [--model M] [--resume ID] -- <prompt>
+
+Prints one JSON result object shaped like the real one (result, session_id,
+is_error, usage, total_cost_usd). In acceptEdits mode it writes
+DELEGATED-claude-<n>.md into the cwd. Session ids are deterministic
+(session-<n>, n counted per cwd) so recordings are stable. --resume of an
+unknown id answers is_error, like the real CLI. FAKE_CLAUDE_SLEEP and
+FAKE_CODEX_LOG (shared with the fake codex) support concurrency/kill tests.
+A prompt containing FAKE:fail or FAKE:garbage triggers a failed run.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] in (["--version"], ["-v"]):
+        print("9.9.9-fake (Claude Code)")
+        return 0
+    if "--" not in argv or "-p" not in argv:
+        print(f"fake claude: unsupported args {argv}", file=sys.stderr)
+        return 2
+    opts, prompt = argv[: argv.index("--")], " ".join(argv[argv.index("--") + 1 :])
+
+    def opt(name: str) -> str:
+        return opts[opts.index(name) + 1] if name in opts else ""
+
+    for required in ("--output-format", "--permission-mode", "--permission-prompts"):
+        if not opt(required):
+            print(f"fake claude: missing {required}", file=sys.stderr)
+            return 2
+    for flag in ("--strict-mcp-config", "--restricted"):
+        if flag not in opts:
+            print(f"fake claude: expected {flag}", file=sys.stderr)
+            return 2
+    # Failure modes on demand, keyed by the prompt (replay cannot set env per call).
+    if "FAKE:fail" in prompt:  # a real error envelope that still reports spend
+        print(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                          "result": "simulated failure inside the run", "session_id": "x",
+                          "usage": {"input_tokens": 50, "output_tokens": 5},
+                          "total_cost_usd": 0.001}))
+        return 1
+    if "FAKE:garbage" in prompt:  # non-zero exit with an unrelated JSON object
+        print(json.dumps({"unrelated": True}))
+        return 3
+    mode, model, resume = opt("--permission-mode"), opt("--model"), opt("--resume")
+    cwd = Path.cwd()
+    state = cwd / ".git" / "fake-claude-sessions" if (cwd / ".git").is_dir() else None
+    # sessions are remembered per repo so --resume works across processes
+    known: list[str] = []
+    if state and state.exists():
+        known = state.read_text().split()
+    if resume and resume not in known:
+        print(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                          "result": f"No conversation found with session ID: {resume}",
+                          "session_id": resume, "total_cost_usd": 0}))
+        return 1
+    delay = float(os.environ.get("FAKE_CLAUDE_SLEEP") or 0)
+    if delay:
+        time.sleep(delay)
+    session = resume or f"session-{len(known) + 1}"
+    if state and not resume:
+        state.write_text(" ".join(known + [session]))
+    written = ""
+    if mode == "acceptEdits" and not resume:
+        target = cwd / f"DELEGATED-claude-{len(known) + 1}.md"
+        target.write_text(f"# delegated\n\n{prompt}\n")
+        written = str(target)
+    log = os.environ.get("FAKE_CODEX_LOG")
+    if log:
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"pid": os.getpid(), "cwd": str(cwd), "sandbox": mode,
+                                 "written": written, "model": model, "cli": "claude"}) + "\n")
+    text = (f"fake claude: replied on {session}" if resume
+            else f"fake claude: done in {mode} mode" + (" (model pinned)" if model else ""))
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False, "result": text,
+        "session_id": session, "num_turns": 1, "duration_ms": 10,
+        "usage": {"input_tokens": 900, "cache_creation_input_tokens": 200,
+                  "cache_read_input_tokens": 100, "output_tokens": 40},
+        "total_cost_usd": 0.0123,
+    }))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

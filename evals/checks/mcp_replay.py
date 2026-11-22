@@ -67,6 +67,19 @@ CALLS: dict[str, list[tuple[str, dict[str, Any]]]] = {
         ("delegate", {"task": "Add a note file", "repo": "demo", "mode": "edit"}),
         ("delegate_reply", {"thread_id": {"$from": 3}, "prompt": "and one more"}),
         ("delegate_reply", {"thread_id": "thread-unknown", "prompt": "hello?"}),
+        # Same task in, same result shape out, on the second adapter.
+        ("delegate", {"task": "Add a note file", "repo": "demo", "mode": "edit", "adapter": "claude"}),
+        ("delegate_reply", {"thread_id": {"$from": 6}, "prompt": "and one more"}),
+        ("delegate", {"task": "Explain hello.py", "repo": "demo", "mode": "review",
+                      "adapter": "claude", "model": "frontier-deep"}),
+        # Adapter x model alias pairs that cannot work are refused before anything runs.
+        ("delegate", {"task": "anything", "repo": "demo", "adapter": "codex", "model": "frontier-deep"}),
+        ("delegate", {"task": "anything", "repo": "demo", "model": "some-concrete-model-id"}),
+        ("delegate", {"task": "anything", "repo": "demo", "adapter": "no-such-cli"}),
+        # A failed run reports an error, keeps its reported spend in the journal,
+        # and never writes the CLI's raw text there.
+        ("delegate", {"task": "FAKE:fail", "repo": "demo", "mode": "review", "adapter": "claude"}),
+        ("delegate", {"task": "FAKE:garbage", "repo": "demo", "mode": "review", "adapter": "claude"}),
     ],
 }
 
@@ -314,6 +327,7 @@ def replay_server(name: str, server: Path, target: Path) -> dict[str, Any]:
             entry = call_entry(resp, notes)
             results.append(entry)
             record["calls"].append({"tool": tool, "arguments": args, "result": entry})
+        record["journal"] = journal_rows(root / "var" / "usage.jsonl")
         return normalise(record, [(str(tmp.resolve()), "<TMP>"), (str(tmp), "<TMP>"),
                                   (str(port), "<PORT>")])
     finally:
@@ -321,6 +335,30 @@ def replay_server(name: str, server: Path, target: Path) -> dict[str, Any]:
             session.close()
         httpd.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+JOURNAL_KEYS = ("tool", "alias", "adapter", "model_alias", "model_resolved", "route", "ok",
+                "fallback", "cached", "prompt_tokens", "completion_tokens", "cost_usd",
+                "tokens_reported", "detail")
+
+
+def journal_rows(path: Path) -> list[dict[str, Any]]:
+    """The usage journal the session wrote, minus wall-clock fields."""
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kept = {k: row[k] for k in JOURNAL_KEYS if k in row}
+        # A delegate row resolves an alias to a concrete model id; the fixture
+        # must not carry concrete names (they live only in harness_lib).
+        if kept.get("route") == "frontier" and not str(kept.get("model_resolved", "")).endswith("-default"):
+            kept["model_resolved"] = "<mapped by harness_lib>"
+        rows.append(kept)
+    return rows
 
 
 def _thread_from_text(entry: dict[str, Any]) -> str:

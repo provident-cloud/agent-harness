@@ -25,8 +25,12 @@ Owner is still tweaking — prefer small commits over sweeping refactors.
 Built and live-verified on two machines, a 32GB Mac and a 128GB laptop. `git log`
 is the changelog. Beyond the original design:
 
-- **Frontier delegation** (`mcp/delegate-server/`): hands scoped tasks to Codex
-  CLI sessions. Requires `codex login`. Every call journaled as `route=frontier`.
+- **Frontier delegation** (`mcp/delegate-server/`): hands scoped tasks to an
+  agent CLI through an adapter (`codex` or `claude`; same task in, same result
+  out). Model is a delegate alias from `DELEGATE_MODELS` in `lib/harness_lib.py`;
+  `bin/local delegate-check` refuses a pair that cannot work. Every call
+  journaled as `route=frontier` with `adapter`, `model_alias`, and `cost_usd`
+  when the CLI reports it.
 - **Response caching**: LiteLLM disk cache (24h TTL, `var/litellm-cache`) plus
   cache-hit labeling in `bin/usage-report`.
 - **Upstream version pins**: `fastapi<0.140` in `setup.sh` (a ceiling, not a
@@ -105,7 +109,7 @@ bin/litellm-agent install  # LaunchAgent: proxy survives reboots and crashes
   **Never do that.** The two configs pull in opposite directions: the template
   points Codex CLI *at this harness's local proxy*, while `delegate` is the
   frontier rung by definition and rejects harness aliases outright
-  (`mcp/delegate-server/server.py`). For delegation, `~/.codex/config.toml` wants
+  (`harness_lib.delegate_combo_problem`). For delegation, `~/.codex/config.toml` wants
   nothing from that template — trust entries and a `codex login` are the whole
   requirement. Only use the template if you separately want to drive Codex itself
   off local models, and then merge the blocks rather than overwrite.

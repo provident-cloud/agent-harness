@@ -10,7 +10,7 @@
         "result": {
           "isError": true,
           "text": [
-            "Error executing tool delegate: 'local-big' is a local harness alias; delegate always runs on the frontier Codex model. For local work use the offload tools."
+            "Error executing tool delegate: 'local-big' is a local harness alias; delegation is the frontier rung and never runs on local models. Use one of: frontier-deep, frontier-default, frontier-fast"
           ]
         },
         "tool": "delegate"
@@ -92,6 +92,134 @@
           ]
         },
         "tool": "delegate_reply"
+      },
+      {
+        "arguments": {
+          "adapter": "claude",
+          "mode": "edit",
+          "repo": "demo",
+          "task": "Add a note file"
+        },
+        "result": {
+          "isError": false,
+          "structuredContent": {
+            "result": "fake claude: done in acceptEdits mode\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-claude-1.md\n\nthreadId: session-1  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
+          },
+          "text": [
+            "fake claude: done in acceptEdits mode\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-claude-1.md\n\nthreadId: session-1  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "prompt": "and one more",
+          "thread_id": {
+            "$from": 6
+          }
+        },
+        "result": {
+          "isError": false,
+          "structuredContent": {
+            "result": "fake claude: replied on session-1\n\nthreadId: session-1\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
+          },
+          "text": [
+            "fake claude: replied on session-1\n\nthreadId: session-1\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
+          ]
+        },
+        "tool": "delegate_reply"
+      },
+      {
+        "arguments": {
+          "adapter": "claude",
+          "mode": "review",
+          "model": "frontier-deep",
+          "repo": "demo",
+          "task": "Explain hello.py"
+        },
+        "result": {
+          "isError": false,
+          "structuredContent": {
+            "result": "fake claude: done in plan mode (model pinned)\n\n--- read-only session; no edits were possible ---\n\nthreadId: session-2  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
+          },
+          "text": [
+            "fake claude: done in plan mode (model pinned)\n\n--- read-only session; no edits were possible ---\n\nthreadId: session-2  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "adapter": "codex",
+          "model": "frontier-deep",
+          "repo": "demo",
+          "task": "anything"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: adapter 'codex' has no model mapped for 'frontier-deep'. With codex use: frontier-default; or map one in config/tier-overrides.yaml `delegate_models: {frontier-deep: {codex: <model>}}`"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "model": "some-concrete-model-id",
+          "repo": "demo",
+          "task": "anything"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: 'some-concrete-model-id' is not a delegate model alias. Use one of: frontier-deep, frontier-default, frontier-fast (concrete model names are mapped in lib/harness_lib.py or config/tier-overrides.yaml `delegate_models:`, never passed directly)"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "adapter": "no-such-cli",
+          "repo": "demo",
+          "task": "anything"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: unknown delegate adapter 'no-such-cli'; expected one of codex, claude"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "adapter": "claude",
+          "mode": "review",
+          "repo": "demo",
+          "task": "FAKE:fail"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: simulated failure inside the run"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "adapter": "claude",
+          "mode": "review",
+          "repo": "demo",
+          "task": "FAKE:garbage"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: claude exited 3 without a result: {\"unrelated\": true}"
+          ]
+        },
+        "tool": "delegate"
       }
     ],
     "initialize": {
@@ -100,22 +228,143 @@
         "resources",
         "tools"
       ],
-      "instructions": "Frontier delegation for this workspace. Two tools:\n\n* delegate       -- hand one scoped task to a Codex session in ONE repo\n* delegate_reply -- continue a previous delegated session by threadId\n\nThis is metered frontier capacity on the user's OpenAI subscription, not the\nfree local rung. Delegate deliberately and say what you are delegating and\nwhy; never route work here just because it is available. Good fits: working\ntwo repos in parallel (you keep one, Codex takes the other), a second model's\nopinion on a cross-repo contract, overflow when you are context- or\nrate-limited. Every call is logged to the usage journal as frontier spend.",
+      "instructions": "Frontier delegation for this workspace. Two tools:\n\n* delegate       -- hand one scoped task to an agent CLI session in ONE repo\n* delegate_reply -- continue a previous delegated session by threadId\n\nThis is metered frontier capacity on the user's own subscription (Codex or\nClaude Code, whichever adapter runs the task), not the free local rung. Delegate deliberately and say what you are delegating and\nwhy; never route work here just because it is available. Good fits: working\ntwo repos in parallel (you keep one, the delegate takes the other), a second model's\nopinion on a cross-repo contract, overflow when you are context- or\nrate-limited. Every call is logged to the usage journal as frontier spend.",
       "name": "harness-delegate",
       "protocolVersion": "2025-06-18"
     },
+    "journal": [
+      {
+        "adapter": "codex",
+        "alias": "codex",
+        "completion_tokens": 34,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "codex-default",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "codex",
+        "alias": "codex",
+        "completion_tokens": 34,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "codex-default",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "codex",
+        "alias": "codex",
+        "completion_tokens": 12,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "codex-default",
+        "ok": true,
+        "prompt_tokens": 300,
+        "route": "frontier",
+        "tool": "delegate_reply"
+      },
+      {
+        "adapter": "codex",
+        "alias": "codex",
+        "detail": "session-not-found",
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "codex-default",
+        "ok": false,
+        "route": "frontier",
+        "tokens_reported": false,
+        "tool": "delegate_reply"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "completion_tokens": 40,
+        "cost_usd": 0.0123,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "claude-default",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "completion_tokens": 40,
+        "cost_usd": 0.0123,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "claude-default",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate_reply"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "completion_tokens": 40,
+        "cost_usd": 0.0123,
+        "fallback": false,
+        "model_alias": "frontier-deep",
+        "model_resolved": "<mapped by harness_lib>",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "completion_tokens": 5,
+        "cost_usd": 0.001,
+        "detail": "error-result-exit-1",
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "claude-default",
+        "ok": false,
+        "prompt_tokens": 50,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "detail": "no-result-exit-3",
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "claude-default",
+        "ok": false,
+        "route": "frontier",
+        "tokens_reported": false,
+        "tool": "delegate"
+      }
+    ],
     "tools": [
       {
         "annotations": {
           "readOnlyHint": false,
-          "title": "Delegate a task to Codex"
+          "title": "Delegate a task to a frontier agent"
         },
-        "description": "Hand one scoped task to a frontier Codex session in a single repo.\n\nMetered frontier capacity on the user's OpenAI subscription -- delegate\ndeliberately, and say in the conversation what you are delegating and why.\nGood fits: parallel multi-repo work (you keep one repo, Codex takes the\nother), a second model's read on a cross-repo contract, or overflow when\nyou are context- or rate-limited. Bad fits: anything a local offload tool\nalready covers (compress_context / workspace_search / draft), or work you\nhave not scoped tightly enough to review as a diff afterwards.\n\nIn edit mode the target repo must have no modified tracked files; the\nresult includes the session's report, a diff summary, and a threadId for\ndelegate_reply follow-ups.\n",
+        "description": "Hand one scoped task to a frontier agent session (Codex or Claude Code) in one repo.\n\nMetered frontier capacity on the user's own subscription -- delegate\ndeliberately, and say in the conversation what you are delegating and why.\nGood fits: parallel multi-repo work (you keep one repo, the delegate takes\nthe other), a second model's read on a cross-repo contract, or overflow when\nyou are context- or rate-limited. Bad fits: anything a local offload tool\nalready covers (compress_context / workspace_search / draft), or work you\nhave not scoped tightly enough to review as a diff afterwards.\n\nIn edit mode the target repo must have no modified tracked files; the\nresult includes the session's report, a diff summary, and a threadId for\ndelegate_reply follow-ups.\n",
         "inputSchema": {
           "properties": {
+            "adapter": {
+              "default": "",
+              "description": "Which agent CLI runs the task: 'codex' or 'claude'. Default: config/harness.yaml delegate.adapter (codex if unset).",
+              "title": "Adapter",
+              "type": "string"
+            },
             "mode": {
               "default": "edit",
-              "description": "edit: Codex may modify the working tree (requires clean tracked files; diff summary returned). review: read-only -- second opinions, audits, explanations.",
+              "description": "edit: the delegate may modify the working tree (requires clean tracked files; diff summary returned). review: read-only -- second opinions, audits, explanations.",
               "enum": [
                 "edit",
                 "review"
@@ -125,7 +374,7 @@
             },
             "model": {
               "default": "",
-              "description": "Optional Codex model override (e.g. a specific gpt-5.x id). Default: the user's own Codex default. Never a harness local alias -- this tool is the frontier rung by definition.",
+              "description": "A delegate model alias, e.g. 'frontier-default' (the CLI's own default). Never a concrete model name and never a local harness alias. Default: config/harness.yaml delegate.model. A pair the adapter cannot run is refused with the aliases that work.",
               "title": "Model",
               "type": "string"
             },
@@ -135,7 +384,7 @@
               "type": "string"
             },
             "task": {
-              "description": "The complete task brief: goal, constraints, and how to verify. Codex sees nothing of the parent conversation, so include everything it needs -- contract details, file hints, acceptance criteria.",
+              "description": "The complete task brief: goal, constraints, and how to verify. The delegate sees nothing of the parent conversation, so include everything it needs -- contract details, file hints, acceptance criteria.",
               "title": "Task",
               "type": "string"
             },
@@ -175,7 +424,7 @@
           "readOnlyHint": false,
           "title": "Continue a delegated session"
         },
-        "description": "Continue an existing delegated Codex session with its context intact.\n\nCheaper and more coherent than starting a fresh delegate call when the\nfollow-up concerns the same task. The session keeps the same repo scoping\nand sandbox it was started with.\n",
+        "description": "Continue an existing delegated session with its context intact.\n\nCheaper and more coherent than starting a fresh delegate call when the\nfollow-up concerns the same task. The session keeps the same adapter, repo\nscoping and sandbox it was started with.\n",
         "inputSchema": {
           "properties": {
             "prompt": {
@@ -333,6 +582,48 @@
       "name": "harness-offload",
       "protocolVersion": "2025-06-18"
     },
+    "journal": [
+      {
+        "alias": "local-big",
+        "cached": false,
+        "completion_tokens": 20,
+        "fallback": false,
+        "model_resolved": "local-big",
+        "ok": true,
+        "prompt_tokens": 100,
+        "route": "local",
+        "tool": "compress_context"
+      },
+      {
+        "alias": "local-fast",
+        "cached": false,
+        "completion_tokens": 20,
+        "fallback": false,
+        "model_resolved": "local-fast",
+        "ok": true,
+        "prompt_tokens": 100,
+        "route": "local",
+        "tool": "draft"
+      },
+      {
+        "alias": "local-embed",
+        "cached": false,
+        "model_resolved": "local-embed",
+        "ok": true,
+        "prompt_tokens": 14,
+        "route": "local",
+        "tool": "workspace_search"
+      },
+      {
+        "alias": "local-embed",
+        "cached": false,
+        "model_resolved": "local-embed",
+        "ok": true,
+        "prompt_tokens": 7,
+        "route": "local",
+        "tool": "workspace_search"
+      }
+    ],
     "tools": [
       {
         "annotations": {

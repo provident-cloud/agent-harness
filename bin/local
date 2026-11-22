@@ -18,6 +18,7 @@ import os  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 import platform  # noqa: E402
 import re  # noqa: E402
+import shutil  # noqa: E402
 import subprocess  # noqa: E402
 import textwrap  # noqa: E402
 import time  # noqa: E402
@@ -730,6 +731,53 @@ def probe_fix(alias: str, model: str, cfg: h.Config, ollama_ok: bool) -> str:
     return f"the model is not pulled locally -- fix: `ollama pull {tag}`"
 
 
+def delegate_report(quiet: bool) -> tuple[dict, list[str]]:
+    """The configured delegate adapter + model alias, checked against each other.
+
+    The same check the delegate server runs before every call
+    (harness_lib.delegate_combo_problem), so a pair that cannot work shows up
+    here instead of as a refused tool call mid-session.
+    """
+    problems: list[str] = []
+    try:
+        adapter, alias = h.delegate_settings()
+        models = h.delegate_models()
+        problem = h.delegate_combo_problem(adapter, alias, models)
+    except h.HarnessError as exc:
+        adapter, alias, models, problem = "?", "?", {}, str(exc)
+    cli = h.DELEGATE_CLIS.get(adapter, "")
+    on_path = bool(cli and shutil.which(cli))
+    cli_problem = h.delegate_cli_problem(adapter) if on_path else ""
+    report = {"adapter": adapter, "model_alias": alias, "cli": cli, "cli_on_path": on_path,
+              "problem": problem, "cli_problem": cli_problem,
+              "aliases": {a: sorted(per) for a, per in sorted(models.items())}}
+    if problem:
+        problems.append(f"delegate config: {problem}")
+    if cli_problem:
+        problems.append(f"delegate CLI: {cli_problem}")
+    if not quiet:
+        h.step("delegation")
+        if problem:
+            h.error(f"adapter {adapter} + model {alias}: {problem}")
+            h.info("  fix: set config/harness.yaml `delegate: {adapter: <a>, model: <alias>}` to a pair below")
+        else:
+            h.ok(f"adapter {adapter} + model {alias}")
+        for a, adapters in report["aliases"].items():
+            h.info(f"  {a.ljust(20)} runs on: {', '.join(adapters) or '(nothing)'}")
+        if cli and not on_path:
+            h.warn(f"`{cli}` is not on PATH -- delegate calls will fail until it is installed")
+        elif cli_problem:
+            h.error(f"{cli}: {cli_problem}")
+    return report, problems
+
+
+def cmd_delegate_check(args: argparse.Namespace) -> int:
+    report, problems = delegate_report(quiet=args.json)
+    if args.json:
+        print(json.dumps({**report, "problems": problems}, indent=2))
+    return 1 if problems else 0
+
+
 def cmd_health(args: argparse.Namespace) -> int:
     cfg = h.load_config(required=False)
     table = cfg.models
@@ -863,6 +911,9 @@ def cmd_health(args: argparse.Namespace) -> int:
                 if not args.json:
                     h.error(f"{alias.ljust(20)} {probe['seconds']:>6.2f}s  {probe['error']}")
                     h.info("  fix: " + probe_fix(alias, table[alias], cfg, ollama_ok))
+
+    report["delegate"], delegate_problems = delegate_report(quiet=args.json)
+    problems.extend(delegate_problems)
 
     report["problems"] = problems
     report["healthy"] = not problems
@@ -1001,6 +1052,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", action="store_true", help="emit the report as JSON")
     p.set_defaults(func=cmd_health)
+
+    p = add(
+        "delegate-check",
+        "check the delegate adapter + model alias pair",
+        "Check config/harness.yaml `delegate:` (adapter, model alias) the way the\n"
+        "delegate server does before every call, and list which aliases run on\n"
+        "which adapter. Needs no proxy. Exits non-zero for a pair that cannot work.\n"
+        "`health` runs the same check.",
+    )
+    p.add_argument("--json", action="store_true", help="emit the result as JSON")
+    p.set_defaults(func=cmd_delegate_check)
 
     return parser
 
