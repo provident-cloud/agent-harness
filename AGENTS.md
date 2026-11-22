@@ -30,7 +30,8 @@ is the changelog. Beyond the original design:
   out). Model is a delegate alias from `DELEGATE_MODELS` in `lib/harness_lib.py`;
   `bin/local delegate-check` refuses a pair that cannot work. Each task runs in
   its own git worktree (`mcp/delegate-server/worktrees.py`) and returns edits on
-  a `delegate/<task-id>` branch. Every call
+  a `delegate/<task-id>` branch. `otel_traces: true` exports one OTLP span per
+  task from its journal row (`lib/harness_lib.py`, stdlib only; off by default). Every call
   journaled as `route=frontier` with `adapter`, `model_alias`, and `cost_usd`
   when the CLI reports it.
 - **Response caching**: LiteLLM disk cache (24h TTL, `var/litellm-cache`) plus

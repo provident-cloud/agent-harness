@@ -53,6 +53,10 @@ environment, so it bills your subscription login. Set
 `delegate: {allow_api_key: true}` in `config/harness.yaml` to let it use the
 key (API billing) instead.
 
+**Tracing.** With `otel_traces: true` in `config/harness.yaml`, each task's
+journal row is also sent as one OpenTelemetry span (role, adapter, model alias,
+tokens, cost, duration, outcome); see `docs/USING.md`. Off by default.
+
 **The journal never stores CLI output.** A failed call is journaled with a
 fixed reason (`auth`, `timeout`, `error-result-exit-1`, `no-result-exit-3`,
 ...) and whatever tokens/cost the failed run reported.
