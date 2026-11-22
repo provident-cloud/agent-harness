@@ -54,6 +54,11 @@ __all__ = [
     "litellm_up",
     "log_usage",
     "read_usage",
+    "DELEGATE_ADAPTERS",
+    "DELEGATE_MODELS",
+    "delegate_models",
+    "delegate_settings",
+    "delegate_combo_problem",
     "read_input",
     "chunk_text",
     "info",
@@ -117,6 +122,85 @@ DEFAULT_MODELS: dict[str, dict[str, str]] = {
         "keep_alive": "10m",
     },
 }
+
+# --------------------------------------------------------------------------
+# Delegation: which agent CLI runs a delegated task, on which model alias.
+#
+# Same contract as the local aliases: nothing outside this file (and
+# config/tier-overrides.yaml) names a concrete model. A delegate model alias
+# maps, per adapter, to the value passed to that CLI's --model flag; None means
+# "pass no --model": the CLI's own configured default. An alias with no entry
+# for an adapter cannot run on it, and delegate_combo_problem() says so.
+# --------------------------------------------------------------------------
+
+DELEGATE_ADAPTERS = ("codex", "claude")
+
+# Which executable each adapter drives. The server checks it is on PATH.
+DELEGATE_CLIS: dict[str, str] = {"codex": "codex", "claude": "claude"}
+
+DELEGATE_MODELS: dict[str, dict[str, str | None]] = {
+    # The CLI's own default model -- whatever `codex` / `claude` is set to use.
+    "frontier-default": {"codex": None, "claude": None},
+    # Claude Code accepts these short names and resolves them to the latest
+    # model in that family itself. Codex has no equivalent stable short names,
+    # so these aliases are claude-only until a team maps them in
+    # config/tier-overrides.yaml under `delegate_models:`.
+    "frontier-deep": {"claude": "opus"},
+    "frontier-fast": {"claude": "sonnet"},
+}
+
+DEFAULT_DELEGATE_ADAPTER = "codex"
+DEFAULT_DELEGATE_MODEL = "frontier-default"
+
+
+def delegate_models(overrides_path: Path | None = None) -> dict[str, dict[str, str | None]]:
+    """DELEGATE_MODELS with ``delegate_models:`` from config/tier-overrides.yaml merged in."""
+    models = {alias: dict(per) for alias, per in DELEGATE_MODELS.items()}
+    path = overrides_path or (config_dir() / "tier-overrides.yaml")
+    if path.exists():
+        data = load_yaml(path, default={}) or {}
+        extra = data.get("delegate_models") or {}
+        if not isinstance(extra, dict):
+            raise HarnessError(f"{path}: `delegate_models:` must be a mapping of alias -> adapter -> model")
+        for alias, per in extra.items():
+            if not isinstance(per, dict):
+                raise HarnessError(f"{path}: delegate_models.{alias} must map adapter -> model")
+            models.setdefault(str(alias), {}).update(
+                {str(a): (None if m in (None, "", "default") else str(m)) for a, m in per.items()}
+            )
+    return models
+
+
+def delegate_combo_problem(adapter: str, alias: str,
+                           models: dict[str, dict[str, str | None]] | None = None) -> str:
+    """Why ``adapter`` cannot run ``alias``, or "" when the pair works."""
+    models = models if models is not None else delegate_models()
+    if adapter not in DELEGATE_ADAPTERS:
+        return f"unknown delegate adapter {adapter!r}; expected one of {', '.join(DELEGATE_ADAPTERS)}"
+    if alias in ALIASES or alias == REMOTE_ALIAS:
+        return (f"{alias!r} is a local harness alias; delegation is the frontier rung and "
+                f"never runs on local models. Use one of: {', '.join(sorted(models))}")
+    if alias not in models:
+        return (f"{alias!r} is not a delegate model alias. Use one of: {', '.join(sorted(models))} "
+                "(concrete model names are mapped in lib/harness_lib.py or "
+                "config/tier-overrides.yaml `delegate_models:`, never passed directly)")
+    if adapter not in models[alias]:
+        works = sorted(a for a in models if adapter in models[a])
+        return (f"adapter {adapter!r} has no model mapped for {alias!r}. With {adapter} use: "
+                f"{', '.join(works)}; or map one in config/tier-overrides.yaml "
+                f"`delegate_models: {{{alias}: {{{adapter}: <model>}}}}`")
+    return ""
+
+
+def delegate_settings(cfg: "Config | None" = None) -> tuple[str, str]:
+    """(adapter, model alias) configured in config/harness.yaml ``delegate:``."""
+    cfg = cfg or load_config(required=False)
+    section = cfg.raw.get("delegate") or {}
+    if not isinstance(section, dict):
+        raise HarnessError("config/harness.yaml: `delegate:` must be a mapping")
+    return (str(section.get("adapter") or DEFAULT_DELEGATE_ADAPTER),
+            str(section.get("model") or DEFAULT_DELEGATE_MODEL))
+
 
 DEFAULT_PORT = 4000
 DEFAULT_HOST = "127.0.0.1"
