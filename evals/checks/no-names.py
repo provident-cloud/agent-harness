@@ -6,16 +6,24 @@ gitignored config/, never in a tracked file. The check needs the names to look
 for them, but must not publish them, so it reads two sources:
 
 * evals/checks/name-denylist.sha256 (tracked): SHA-256 of each lower-cased name,
-  so CI and a fresh clone can run the check without learning the names.
+  so CI and a fresh clone can run the check without the names in plain text.
+  This avoids publishing them; it is not confidentiality -- a guessed name can
+  be confirmed against a hash. Names that must stay confidential go only in
+  the gitignored file below.
 * config/name-denylist.txt (gitignored, optional): plain names, one per line,
   for a team's own additions. `name` or `name substr`.
 
 Matching is on lower-cased [a-z0-9]+ tokens. Mode `token` matches a whole token;
 mode `substr` matches inside a token too (for names no English word contains).
-Hits are printed masked, so the check's own output does not leak the name.
+Hits are printed fully redacted (paths too), so the check's own output and
+bin/eval's saved transcript do not leak the name.
 
-Exemptions are (path, name-hash) pairs in name-exemptions.txt, never whole
-files, so an exempt file still fails on any other name.
+Content is read from git's index (blobs, symlink targets included), not the
+working tree, so what is checked is what would be committed.
+
+Exemptions in name-exemptions.txt are (path, name-hash, line-prefix) triples,
+never whole files: the name is tolerated only on lines of that file that start
+with that prefix.
 
 Target tree: $HARNESS_EVAL_TARGET (set by bin/eval), else the cwd.
 Exit 0 clean, 1 hits, 2 misconfigured (an empty denylist is a failure, loudly).
@@ -59,15 +67,22 @@ def load_denylist() -> dict[str, tuple[str, int]]:
     return entries
 
 
-def load_exemptions() -> set[tuple[str, str]]:
+def load_exemptions() -> list[tuple[str, str, str]]:
     path = HERE / "name-exemptions.txt"
-    out: set[tuple[str, str]] = set()
+    out: list[tuple[str, str, str]] = []
     if path.exists():
         for line in path.read_text().splitlines():
-            parts = line.split("#", 1)[0].split()
-            if len(parts) == 2:
-                out.add((parts[0], parts[1]))
+            parts = line.split("#", 1)[0].split(None, 2)
+            if len(parts) == 3:
+                out.append((parts[0], parts[1], parts[2].strip()))
     return out
+
+
+def exempt(rel: str, digest: str, line: str | None, rules: list[tuple[str, str, str]]) -> bool:
+    if line is None:  # a file path is never exempt
+        return False
+    return any(rel == p and digest == d and line.lstrip().startswith(prefix)
+               for p, d, prefix in rules)
 
 
 def hits_in(text: str, deny: dict[str, tuple[str, int]]) -> list[str]:
@@ -87,12 +102,40 @@ def hits_in(text: str, deny: dict[str, tuple[str, int]]) -> list[str]:
     return found
 
 
-def mask(line: str, deny: dict[str, tuple[str, int]]) -> str:
+def mask(text: str, deny: dict[str, tuple[str, int]]) -> str:
+    """Replace every word that carries a denylisted name with [redacted]."""
     def repl(m: re.Match[str]) -> str:
-        word = m.group(0)
-        return word[0] + "*" * (len(word) - 1) if hits_in(word, deny) else word
+        return "[redacted]" if hits_in(m.group(0), deny) else m.group(0)
 
-    return re.sub(r"[A-Za-z0-9]+", repl, line.strip())[:160]
+    return re.sub(r"[A-Za-z0-9]+", repl, text.strip())[:160]
+
+
+def index_blobs(target: Path) -> list[tuple[str, bytes]]:
+    """(path, content) for every entry in git's index; symlinks yield their target."""
+    listing = subprocess.run(
+        ["git", "-C", str(target), "ls-files", "-z", "-s"],
+        capture_output=True, check=True,
+    ).stdout.split(b"\0")
+    entries = []
+    for row in filter(None, listing):
+        meta, _, path = row.partition(b"\t")
+        mode, sha, _stage = meta.split()
+        if mode == b"160000":  # submodule: no blob to read
+            entries.append((path.decode(errors="replace"), sha, False))
+        else:
+            entries.append((path.decode(errors="replace"), sha, True))
+    shas = b"".join(sha + b"\n" for _, sha, blob in entries if blob)
+    out = subprocess.run(["git", "-C", str(target), "cat-file", "--batch"],
+                         input=shas, capture_output=True, check=True).stdout
+    blobs: dict[bytes, bytes] = {}
+    pos = 0
+    while pos < len(out):
+        nl = out.index(b"\n", pos)
+        sha, _type, size = out[pos:nl].split()
+        start = nl + 1
+        blobs[sha] = out[start : start + int(size)]
+        pos = start + int(size) + 1
+    return [(path, blobs.get(sha, b"")) for path, sha, _ in entries]
 
 
 def main() -> int:
@@ -101,33 +144,28 @@ def main() -> int:
     if not deny:
         print("no-names: denylist is empty -- refusing to report a clean tree", file=sys.stderr)
         return 2
-    exempt = load_exemptions()
-    files = subprocess.run(
-        ["git", "-C", str(target), "ls-files", "-z"], capture_output=True, text=True, check=True
-    ).stdout.split("\0")
+    rules = load_exemptions()
+    entries = index_blobs(target)
     problems: list[str] = []
-    for rel in filter(None, files):
-        for d in hits_in(rel, deny):
-            if (rel, d) not in exempt:
-                problems.append(f"{rel}: (file path) {mask(rel, deny)}")
-        path = target / rel
-        if path.is_symlink() or not path.is_file():
-            continue
-        try:
-            text = path.read_text()
-        except (UnicodeDecodeError, OSError):
+    for rel, blob in entries:
+        shown = mask(rel, deny)
+        for d in set(hits_in(rel, deny)):
+            if not exempt(rel, d, None, rules):
+                problems.append(f"{shown}: (file path)")
+        if b"\0" in blob[:8000]:
             continue  # binary
+        text = blob.decode(errors="replace")
         for lineno, line in enumerate(text.splitlines(), 1):
             for d in set(hits_in(line, deny)):
-                if (rel, d) not in exempt:
-                    problems.append(f"{rel}:{lineno}: {mask(line, deny)}")
+                if not exempt(rel, d, line, rules):
+                    problems.append(f"{shown}:{lineno}: {mask(line, deny)}")
     if problems:
         for p in sorted(set(problems)):
             print(p)
         print(f"no-names: {len(set(problems))} hit(s) for a denylisted name "
               f"({len(deny)} names checked); move it to config/ or make it generic")
         return 1
-    print(f"no-names: clean ({len(files) - 1} tracked files, {len(deny)} names checked)")
+    print(f"no-names: clean ({len(entries)} tracked files, {len(deny)} names checked)")
     return 0
 
 
