@@ -658,7 +658,8 @@ is 0 regardless of verdicts unless you pass --strict.
     parser.add_argument("--dry-run", action="store_true", help="show what would run; change nothing")
     parser.add_argument("--json", action="store_true", help="emit results as JSON on stdout")
     parser.add_argument(
-        "--strict", action="store_true", help="exit non-zero if any case fails or is inconclusive"
+        "--strict", action="store_true",
+        help="exit non-zero if any case fails or is inconclusive, or any self-check does not pass"
     )
     parser.add_argument(
         "--checks-only", action="store_true",
@@ -678,6 +679,9 @@ def main(argv: list[str] | None = None) -> int:
     cases = [] if args.checks_only else load_cases()
     if args.rev and not args.checks_only:
         raise h.HarnessError("--rev applies to self-checks only; add --checks-only")
+
+    if args.checks_only and args.strict and not checks:
+        raise h.HarnessError(f"--checks-only --strict: no checks in {CHECKS_FILE}; refusing to pass")
 
     if not cases and not checks:
         message = (
@@ -773,6 +777,12 @@ def main(argv: list[str] | None = None) -> int:
         print_summary(results, run_dir)
 
     if args.strict and any(r["status"] in ("fail", "inconclusive") for r in results):
+        return 1
+    # A self-check is deterministic, so under --strict anything short of a pass
+    # (skipped, disabled) is a failure: CI must not go green on a check that
+    # never ran. Agent cases keep their old rule -- a missing checkout skips.
+    if args.strict and any(r.get("kind") == "check" and r["status"] != "pass" for r in results):
+        h.error("--strict: a self-check did not pass (skipped or disabled counts)")
         return 1
     return 0
 
