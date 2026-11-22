@@ -190,6 +190,36 @@
           ]
         },
         "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "adapter": "claude",
+          "mode": "review",
+          "repo": "demo",
+          "task": "FAKE:fail"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: simulated failure inside the run"
+          ]
+        },
+        "tool": "delegate"
+      },
+      {
+        "arguments": {
+          "adapter": "claude",
+          "mode": "review",
+          "repo": "demo",
+          "task": "FAKE:garbage"
+        },
+        "result": {
+          "isError": true,
+          "text": [
+            "Error executing tool delegate: claude exited 3 without a result: {\"unrelated\": true}"
+          ]
+        },
+        "tool": "delegate"
       }
     ],
     "initialize": {
@@ -202,6 +232,121 @@
       "name": "harness-delegate",
       "protocolVersion": "2025-06-18"
     },
+    "journal": [
+      {
+        "adapter": "codex",
+        "alias": "codex",
+        "completion_tokens": 34,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "codex-default",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "codex",
+        "alias": "codex",
+        "completion_tokens": 34,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "codex-default",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "codex",
+        "alias": "codex",
+        "completion_tokens": 12,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "codex-default",
+        "ok": true,
+        "prompt_tokens": 300,
+        "route": "frontier",
+        "tool": "delegate_reply"
+      },
+      {
+        "adapter": "codex",
+        "alias": "codex",
+        "detail": "session-not-found",
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "codex-default",
+        "ok": false,
+        "route": "frontier",
+        "tokens_reported": false,
+        "tool": "delegate_reply"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "completion_tokens": 40,
+        "cost_usd": 0.0123,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "claude-default",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "completion_tokens": 40,
+        "cost_usd": 0.0123,
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "claude-default",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate_reply"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "completion_tokens": 40,
+        "cost_usd": 0.0123,
+        "fallback": false,
+        "model_alias": "frontier-deep",
+        "model_resolved": "<mapped by harness_lib>",
+        "ok": true,
+        "prompt_tokens": 1200,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "completion_tokens": 5,
+        "cost_usd": 0.001,
+        "detail": "error-result-exit-1",
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "claude-default",
+        "ok": false,
+        "prompt_tokens": 50,
+        "route": "frontier",
+        "tool": "delegate"
+      },
+      {
+        "adapter": "claude",
+        "alias": "claude",
+        "detail": "no-result-exit-3",
+        "fallback": false,
+        "model_alias": "frontier-default",
+        "model_resolved": "claude-default",
+        "ok": false,
+        "route": "frontier",
+        "tokens_reported": false,
+        "tool": "delegate"
+      }
+    ],
     "tools": [
       {
         "annotations": {
@@ -437,6 +582,48 @@
       "name": "harness-offload",
       "protocolVersion": "2025-06-18"
     },
+    "journal": [
+      {
+        "alias": "local-big",
+        "cached": false,
+        "completion_tokens": 20,
+        "fallback": false,
+        "model_resolved": "local-big",
+        "ok": true,
+        "prompt_tokens": 100,
+        "route": "local",
+        "tool": "compress_context"
+      },
+      {
+        "alias": "local-fast",
+        "cached": false,
+        "completion_tokens": 20,
+        "fallback": false,
+        "model_resolved": "local-fast",
+        "ok": true,
+        "prompt_tokens": 100,
+        "route": "local",
+        "tool": "draft"
+      },
+      {
+        "alias": "local-embed",
+        "cached": false,
+        "model_resolved": "local-embed",
+        "ok": true,
+        "prompt_tokens": 14,
+        "route": "local",
+        "tool": "workspace_search"
+      },
+      {
+        "alias": "local-embed",
+        "cached": false,
+        "model_resolved": "local-embed",
+        "ok": true,
+        "prompt_tokens": 7,
+        "route": "local",
+        "tool": "workspace_search"
+      }
+    ],
     "tools": [
       {
         "annotations": {

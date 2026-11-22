@@ -3,7 +3,7 @@
 
 Covers what mcp/delegate-server/adapters.py ClaudeAdapter runs:
 
-    claude -p --output-format json --permission-mode acceptEdits|plan
+    claude -p --output-format json --restricted --permission-mode acceptEdits|plan
            --permission-prompts none --strict-mcp-config
            --append-system-prompt <brief> [--model M] [--resume ID] -- <prompt>
 
@@ -13,6 +13,7 @@ DELEGATED-claude-<n>.md into the cwd. Session ids are deterministic
 (session-<n>, n counted per cwd) so recordings are stable. --resume of an
 unknown id answers is_error, like the real CLI. FAKE_CLAUDE_SLEEP and
 FAKE_CODEX_LOG (shared with the fake codex) support concurrency/kill tests.
+A prompt containing FAKE:fail or FAKE:garbage triggers a failed run.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ from pathlib import Path
 
 def main(argv: list[str]) -> int:
     if argv[:1] in (["--version"], ["-v"]):
-        print("0.0.0-fake (Claude Code)")
+        print("9.9.9-fake (Claude Code)")
         return 0
     if "--" not in argv or "-p" not in argv:
         print(f"fake claude: unsupported args {argv}", file=sys.stderr)
@@ -39,9 +40,20 @@ def main(argv: list[str]) -> int:
         if not opt(required):
             print(f"fake claude: missing {required}", file=sys.stderr)
             return 2
-    if "--strict-mcp-config" not in opts:
-        print("fake claude: expected --strict-mcp-config", file=sys.stderr)
-        return 2
+    for flag in ("--strict-mcp-config", "--restricted"):
+        if flag not in opts:
+            print(f"fake claude: expected {flag}", file=sys.stderr)
+            return 2
+    # Failure modes on demand, keyed by the prompt (replay cannot set env per call).
+    if "FAKE:fail" in prompt:  # a real error envelope that still reports spend
+        print(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                          "result": "simulated failure inside the run", "session_id": "x",
+                          "usage": {"input_tokens": 50, "output_tokens": 5},
+                          "total_cost_usd": 0.001}))
+        return 1
+    if "FAKE:garbage" in prompt:  # non-zero exit with an unrelated JSON object
+        print(json.dumps({"unrelated": True}))
+        return 3
     mode, model, resume = opt("--permission-mode"), opt("--model"), opt("--resume")
     cwd = Path.cwd()
     state = cwd / ".git" / "fake-claude-sessions" if (cwd / ".git").is_dir() else None
