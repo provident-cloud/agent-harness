@@ -67,6 +67,15 @@ CALLS: dict[str, list[tuple[str, dict[str, Any]]]] = {
         ("delegate", {"task": "Add a note file", "repo": "demo", "mode": "edit"}),
         ("delegate_reply", {"thread_id": {"$from": 3}, "prompt": "and one more"}),
         ("delegate_reply", {"thread_id": "thread-unknown", "prompt": "hello?"}),
+        # Same task in, same result shape out, on the second adapter.
+        ("delegate", {"task": "Add a note file", "repo": "demo", "mode": "edit", "adapter": "claude"}),
+        ("delegate_reply", {"thread_id": {"$from": 6}, "prompt": "and one more"}),
+        ("delegate", {"task": "Explain hello.py", "repo": "demo", "mode": "review",
+                      "adapter": "claude", "model": "frontier-deep"}),
+        # Adapter x model alias pairs that cannot work are refused before anything runs.
+        ("delegate", {"task": "anything", "repo": "demo", "adapter": "codex", "model": "frontier-deep"}),
+        ("delegate", {"task": "anything", "repo": "demo", "model": "some-concrete-model-id"}),
+        ("delegate", {"task": "anything", "repo": "demo", "adapter": "no-such-cli"}),
     ],
 }
 
