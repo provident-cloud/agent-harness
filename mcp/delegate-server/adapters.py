@@ -173,6 +173,7 @@ class _CodexChild:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,  # own process group: shutdown kills its tool runs too
             )
             init_id = self._send({"method": "initialize", "params": {
                 "protocolVersion": "2025-06-18", "capabilities": {},
@@ -258,9 +259,9 @@ class _CodexChild:
         except asyncio.TimeoutError as exc:
             raise AdapterError(
                 f"the delegated session exceeded {timeout_s}s and was "
-                "abandoned (the Codex session may still finish in the "
-                "background and its edits may land). Check `git status` in "
-                "the repo; retry with a smaller task or a longer timeout_s."
+                "abandoned. Its worktree is removed, so nothing it does from "
+                "here on lands anywhere; retry with a smaller task or a "
+                "longer timeout_s."
             ) from exc
         finally:
             self._futures.pop(call_id, None)
@@ -533,6 +534,7 @@ class ClaudeAdapter:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,  # its own process group, so a kill takes its children too
         )
+        _CLAUDE_PROCS.add(proc.pid)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=task.timeout_s)
         except asyncio.TimeoutError as exc:
@@ -544,6 +546,8 @@ class ClaudeAdapter:
         except asyncio.CancelledError:
             await _kill_group(proc)
             raise
+        finally:
+            _CLAUDE_PROCS.discard(proc.pid)
         await _kill_group(proc)  # leader exited; reap anything it left in its group
         data = _last_json(out.decode(errors="replace"))
         envelope = isinstance(data, dict) and data.get("type") == "result"
@@ -624,6 +628,28 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:
             pass
+
+
+_CLAUDE_PROCS: set[int] = set()
+
+
+def kill_all_children() -> None:
+    """Synchronously kill every agent CLI this process started. For shutdown
+    paths (signal handler, atexit), where awaiting is not an option."""
+    for pgid in list(_CLAUDE_PROCS):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError):
+                break
+    _CLAUDE_PROCS.clear()
+    child = _CHILD.proc
+    if child is not None and child.returncode is None:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(child.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                break
 
 
 ADAPTERS: dict[str, Any] = {"codex": CodexAdapter(), "claude": ClaudeAdapter()}

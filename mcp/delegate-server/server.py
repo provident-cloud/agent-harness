@@ -19,7 +19,9 @@ never as an automatic router.
 Everything here is scoped and accounted for:
 
 * every session is pinned to ONE configured repo (``config/repos.yaml``)
-* edit sessions require a clean tracked tree, and report a diff summary back
+* every task runs in its own fresh git worktree of that repo (worktrees.py),
+  removed when the task ends -- however it ends; edits land on a
+  ``delegate/<task-id>`` branch, never in the user's checkout
 * every call lands in ``var/usage.jsonl`` with ``route="frontier"`` so
   ``bin/usage-report`` shows the metered spend instead of hiding it
 * the user's personal MCP servers (Slack, GitHub, ...) are disabled for the
@@ -34,7 +36,9 @@ Launched from arbitrary working directories, so the harness root comes from
 
 from __future__ import annotations
 
+import atexit
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -53,7 +57,8 @@ from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from mcp.types import ToolAnnotations  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from adapters import ADAPTERS, AdapterError, Result, Task  # noqa: E402
+from adapters import ADAPTERS, AdapterError, Result, Task, kill_all_children  # noqa: E402
+import worktrees as wt  # noqa: E402
 
 # A delegated task is a real agentic session: reads, edits, test runs. Give it
 # room. The caller can lower this per call; the ceiling stops a wedged session
@@ -128,30 +133,33 @@ def _git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def _tracked_dirty(repo: Path) -> list[str]:
-    """Porcelain lines for tracked changes; untracked files are not blockers."""
-    out = _git(repo, "status", "--porcelain")
-    return [ln for ln in out.splitlines() if ln and not ln.startswith("??")]
-
-
-def _diff_summary(repo: Path, before_untracked: set[str]) -> str:
-    stat = _git(repo, "diff", "--stat") or "(no tracked changes)"
-    untracked_now = {
-        ln[3:] for ln in _git(repo, "status", "--porcelain").splitlines() if ln.startswith("??")
-    }
-    new_files = sorted(untracked_now - before_untracked)
+def _worktree_summary(lease: wt.Lease) -> str:
+    stat = _git(lease.path, "diff", "--stat") or "(no tracked changes)"
+    new_files = sorted(ln[3:] for ln in wt.changes(lease) if ln.startswith("??"))
     parts = [stat]
     if new_files:
         parts.append("new untracked files: " + ", ".join(new_files[:20]))
     return "\n".join(parts)
 
 
-def _untracked(repo: Path) -> set[str]:
-    return {
-        ln[3:] for ln in _git(repo, "status", "--porcelain").splitlines() if ln.startswith("??")
-    }
-
-
+def _take_changes(lease: wt.Lease, label: str, note: str) -> str:
+    """Commit the task's edits onto its branch and say how to get them."""
+    summary = _worktree_summary(lease)
+    try:
+        sha = wt.commit_to_branch(lease, f"delegate: {label}\n\n{note}")
+    except wt.WorktreeError as exc:
+        h.warn(f"delegate: could not keep the edits of task {lease.task_id}: {exc}")
+        return (f"--- diff summary ---\n{summary}\n\nwarning: the edits could NOT be "
+                f"saved to a branch ({exc}); they are lost with the worktree.")
+    if not sha:
+        if wt.branch_exists(lease.repo, lease.branch):
+            return f"--- diff summary ---\n{summary}\n\n(no new changes; {lease.branch} is unchanged)"
+        return f"--- diff summary ---\n{summary}\n\n(no changes, so no branch was created)"
+    base = lease.base[:12]
+    return (f"--- diff summary ---\n{summary}\n\n"
+            f"--- changes are on branch {lease.branch} (commit {sha[:12]}, based on {base}) ---\n"
+            f"review: git diff {base}..{lease.branch}\n"
+            f"take:   git merge --ff-only {lease.branch}   (or cherry-pick it)")
 
 
 # --------------------------------------------------------------------------
@@ -269,9 +277,9 @@ async def delegate(
         "work repo A is the intended split."
     ))],
     mode: Annotated[Literal["edit", "review"], Field(description=(
-        "edit: the delegate may modify the working tree (requires clean tracked "
-        "files; diff summary returned). review: read-only -- second opinions, "
-        "audits, explanations."
+        "edit: the delegate may modify files in its own worktree; the changes "
+        "come back on a delegate/<task-id> branch with a diff summary. review: "
+        "read-only -- second opinions, audits, explanations."
     ))] = "edit",
     adapter: Annotated[str, Field(description=(
         "Which agent CLI runs the task: 'codex' or 'claude'. Default: "
@@ -297,43 +305,51 @@ async def delegate(
     already covers (compress_context / workspace_search / draft), or work you
     have not scoped tightly enough to review as a diff afterwards.
 
-    In edit mode the target repo must have no modified tracked files; the
-    result includes the session's report, a diff summary, and a threadId for
-    delegate_reply follow-ups.
+    The session runs in a fresh git worktree of the repo at its HEAD (your own
+    checkout is never touched, and may be dirty). In edit mode its changes are
+    committed to a delegate/<task-id> branch; the result includes the session's
+    report, a diff summary, that branch, and a threadId for delegate_reply.
     """
     adapter_name, alias, concrete = _resolve_runner(adapter, model)
     repo_path = _resolve_repo(repo)
-    if mode == "edit":
-        dirty = _tracked_dirty(repo_path)
-        if dirty:
-            raise ToolError(
-                f"{repo} has {len(dirty)} modified tracked file(s) "
-                f"(e.g. {dirty[0].strip()}). Commit or stash first, or use "
-                "mode='review' -- delegate never edits over uncommitted work."
-            )
-    before_untracked = _untracked(repo_path)
-
-    job = Task(prompt=task, cwd=repo_path, mode=mode, model=concrete,
-               brief=_DEVELOPER_BRIEF, timeout_s=timeout_s)
-    started = time.time()
     try:
-        result = await ADAPTERS[adapter_name].run(job)
-    except AdapterError as exc:
-        _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
-                      ok=False, started=started, result=exc.result, reason=exc.reason)
+        lease = wt.create(repo_path, h.var_dir())
+    except wt.WorktreeError as exc:
         raise ToolError(str(exc)) from exc
+    with lease:  # removed on return, error, timeout and cancellation alike
+        if mode == "edit":
+            dirty = wt.tracked_dirty(lease)
+            if dirty:
+                raise ToolError(
+                    f"the task worktree of {repo} has {len(dirty)} modified tracked file(s) "
+                    f"straight after checkout (e.g. {dirty[0].strip()}) -- a checkout hook or "
+                    "filter is rewriting files. Delegate never edits over uncommitted work."
+                )
+        job = Task(prompt=task, cwd=lease.path, mode=mode, model=concrete,
+                   brief=_DEVELOPER_BRIEF, timeout_s=timeout_s)
+        started = time.time()
+        try:
+            result = await ADAPTERS[adapter_name].run(job)
+        except AdapterError as exc:
+            _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
+                          ok=False, started=started, result=exc.result, reason=exc.reason)
+            raise ToolError(str(exc)) from exc
 
-    _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
-                  ok=True, started=started, result=result)
-    if result.thread_id:
-        _THREADS[result.thread_id] = {"adapter": adapter_name, "alias": alias,
-                                      "concrete": concrete, "cwd": repo_path, "mode": mode}
+        _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
+                      ok=True, started=started, result=result)
+        if result.thread_id:
+            _THREADS[result.thread_id] = {
+                "adapter": adapter_name, "alias": alias, "concrete": concrete,
+                "repo": repo_path, "mode": mode, "task_id": lease.task_id, "base": lease.base}
 
-    parts = [result.text or f"({adapter_name} returned no final message)"]
-    if mode == "edit":
-        parts.append("--- diff summary ---\n" + _diff_summary(repo_path, before_untracked))
-    else:
-        parts.append("--- read-only session; no edits were possible ---")
+        parts = [result.text or f"({adapter_name} returned no final message)"]
+        if mode == "edit":
+            parts.append(_take_changes(lease, task.strip().splitlines()[0][:60] if task.strip() else "task",
+                                       f"adapter: {adapter_name}, model alias: {alias}"))
+        else:
+            parts.append("--- read-only session; no edits were possible ---")
+    parts.append(f"(worked from {repo} HEAD {lease.base[:12]} in a worktree that is now removed; "
+                 "uncommitted changes in your checkout were not visible to it)")
     if result.thread_id:
         parts.append(f"threadId: {result.thread_id}  (continue with delegate_reply)")
     parts.extend(result.warnings)
@@ -360,27 +376,61 @@ async def delegate_reply(
     follow-up concerns the same task. The session keeps the same adapter, repo
     scoping and sandbox it was started with.
     """
-    # A thread this process did not start can only be a Codex thread from an
-    # earlier server process; Codex answers "Session not found" for it.
-    known = _THREADS.get(thread_id) or {"adapter": "codex", "alias": h.DEFAULT_DELEGATE_MODEL,
-                                         "concrete": None, "cwd": Path.cwd(), "mode": "review"}
+    known = _THREADS.get(thread_id)
+    if known is None:
+        # A thread this process did not start can only be a Codex thread from an
+        # earlier server process; Codex answers "Session not found" for it.
+        return await _reply_unknown(thread_id, prompt, timeout_s)
     adapter_name = known["adapter"]
-    job = Task(prompt=prompt, cwd=known["cwd"], mode=known["mode"], model=known["concrete"],
-               brief=_DEVELOPER_BRIEF, timeout_s=timeout_s)
-    started = time.time()
+    repo_path: Path = known["repo"]
+    # Same task id -> same worktree path the session was started in; the agent
+    # CLI remembers its cwd. Start from the task's branch if it has one.
+    start = (wt.BRANCH_PREFIX + known["task_id"]
+             if wt.branch_exists(repo_path, wt.BRANCH_PREFIX + known["task_id"]) else known["base"])
     try:
-        result = await ADAPTERS[adapter_name].reply(thread_id, job)
-    except AdapterError as exc:
+        lease = wt.create(repo_path, h.var_dir(), start=start, task_id=known["task_id"])
+    except wt.WorktreeError as exc:
+        raise ToolError(f"{exc} -- is a follow-up on this thread still running?") from exc
+    lease.base = known["base"]
+    with lease:
+        job = Task(prompt=prompt, cwd=lease.path, mode=known["mode"], model=known["concrete"],
+                   brief=_DEVELOPER_BRIEF, timeout_s=timeout_s)
+        started = time.time()
+        try:
+            result = await ADAPTERS[adapter_name].reply(thread_id, job)
+        except AdapterError as exc:
+            _log_delegate("delegate_reply", adapter=adapter_name, alias=known["alias"],
+                          concrete=known["concrete"], ok=False, started=started,
+                          result=exc.result, reason=exc.reason)
+            raise ToolError(str(exc)) from exc
         _log_delegate("delegate_reply", adapter=adapter_name, alias=known["alias"],
-                      concrete=known["concrete"], ok=False, started=started,
-                      result=exc.result, reason=exc.reason)
-        raise ToolError(str(exc)) from exc
-    _log_delegate("delegate_reply", adapter=adapter_name, alias=known["alias"],
-                  concrete=known["concrete"], ok=True, started=started, result=result)
-    parts = [result.text or f"({adapter_name} returned no final message)"]
+                      concrete=known["concrete"], ok=True, started=started, result=result)
+        parts = [result.text or f"({adapter_name} returned no final message)"]
+        if known["mode"] == "edit":
+            parts.append(_take_changes(lease, f"follow-up on {thread_id}",
+                                       f"adapter: {adapter_name}, model alias: {known['alias']}"))
     if result.thread_id:
         parts.append(f"threadId: {result.thread_id}")
     parts.append(_spend_line(adapter_name, result))
+    return "\n\n".join(parts)
+
+
+async def _reply_unknown(thread_id: str, prompt: str, timeout_s: int) -> str:
+    job = Task(prompt=prompt, cwd=Path.cwd(), mode="review", model=None,
+               brief=_DEVELOPER_BRIEF, timeout_s=timeout_s)
+    started = time.time()
+    try:
+        result = await ADAPTERS["codex"].reply(thread_id, job)
+    except AdapterError as exc:
+        _log_delegate("delegate_reply", adapter="codex", alias=h.DEFAULT_DELEGATE_MODEL,
+                      concrete=None, ok=False, started=started, result=exc.result, reason=exc.reason)
+        raise ToolError(str(exc)) from exc
+    _log_delegate("delegate_reply", adapter="codex", alias=h.DEFAULT_DELEGATE_MODEL,
+                  concrete=None, ok=True, started=started, result=result)
+    parts = [result.text or "(codex returned no final message)"]
+    if result.thread_id:
+        parts.append(f"threadId: {result.thread_id}")
+    parts.append(_spend_line("codex", result))
     return "\n\n".join(parts)
 
 
@@ -395,6 +445,31 @@ def _startup_check() -> None:
         h.warn(f"delegate: configured default will be refused -- {problem}")
 
 
-if __name__ == "__main__":
+def _shutdown(signum: int, _frame: object) -> None:
+    """SIGTERM/SIGHUP/SIGINT: stop the agent CLIs, remove every task worktree, exit.
+
+    Runs synchronously in the signal handler on purpose: an orderly asyncio
+    shutdown can wait on a wedged child, and the one promise here is that a
+    killed server leaves no worktree behind. SIGKILL cannot be caught; the
+    startup sweep covers it.
+    """
+    kill_all_children()
+    wt.release_all()
+    os._exit(128 + signum)
+
+
+def _startup() -> None:
     _startup_check()
+    removed = wt.sweep(h.var_dir())
+    if removed:
+        h.warn(f"delegate: removed {len(removed)} stale task worktree(s) left by a dead server: "
+               + ", ".join(removed))
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, _shutdown)
+    atexit.register(wt.release_all)  # stdin closed / normal exit
+    atexit.register(kill_all_children)
+
+
+if __name__ == "__main__":
+    _startup()
     mcp.run()
