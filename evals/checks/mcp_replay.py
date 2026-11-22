@@ -343,7 +343,7 @@ def replay_server(name: str, server: Path, target: Path) -> dict[str, Any]:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-JOURNAL_KEYS = ("tool", "alias", "adapter", "model_alias", "model_resolved", "route", "ok",
+JOURNAL_KEYS = ("tool", "alias", "adapter", "role", "model_alias", "model_resolved", "route", "ok",
                 "fallback", "cached", "prompt_tokens", "completion_tokens", "cost_usd",
                 "tokens_reported", "detail")
 

@@ -244,6 +244,7 @@
         "model_resolved": "codex-default",
         "ok": true,
         "prompt_tokens": 1200,
+        "role": "review",
         "route": "frontier",
         "tool": "delegate"
       },
@@ -256,6 +257,7 @@
         "model_resolved": "codex-default",
         "ok": true,
         "prompt_tokens": 1200,
+        "role": "edit",
         "route": "frontier",
         "tool": "delegate"
       },
@@ -268,6 +270,7 @@
         "model_resolved": "codex-default",
         "ok": true,
         "prompt_tokens": 300,
+        "role": "edit",
         "route": "frontier",
         "tool": "delegate_reply"
       },
@@ -281,6 +284,7 @@
         "model_resolved": "claude-default",
         "ok": true,
         "prompt_tokens": 1200,
+        "role": "edit",
         "route": "frontier",
         "tool": "delegate"
       },
@@ -294,6 +298,7 @@
         "model_resolved": "claude-default",
         "ok": true,
         "prompt_tokens": 1200,
+        "role": "edit",
         "route": "frontier",
         "tool": "delegate_reply"
       },
@@ -307,6 +312,7 @@
         "model_resolved": "<mapped by harness_lib>",
         "ok": true,
         "prompt_tokens": 1200,
+        "role": "review",
         "route": "frontier",
         "tool": "delegate"
       },
@@ -321,6 +327,7 @@
         "model_resolved": "claude-default",
         "ok": false,
         "prompt_tokens": 50,
+        "role": "review",
         "route": "frontier",
         "tool": "delegate"
       },
@@ -332,6 +339,7 @@
         "model_alias": "frontier-default",
         "model_resolved": "claude-default",
         "ok": false,
+        "role": "review",
         "route": "frontier",
         "tokens_reported": false,
         "tool": "delegate"
@@ -371,6 +379,13 @@
             "repo": {
               "description": "Name of the target repo exactly as listed in config/repos.yaml. The session is confined to that checkout. Delegating repo B while you work repo A is the intended split.",
               "title": "Repo",
+              "type": "string"
+            },
+            "role": {
+              "default": "",
+              "description": "Optional free-form label for what this task is (e.g. 'builder', 'reviewer'). Recorded in the usage journal and on the task's trace span; changes nothing about how the task runs. Default: the mode.",
+              "maxLength": 64,
+              "title": "Role",
               "type": "string"
             },
             "task": {
