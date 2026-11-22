@@ -1,11 +1,10 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.11"
-# # mcp 2.0.0 removed mcp.server.fastmcp (the server package was restructured
-# # around mcp.server.mcpserver). This file targets the FastMCP API, so an
-# # unpinned `mcp>=1.9` resolves to 2.x and the server dies at import with
-# # "No module named 'mcp.server.fastmcp'". 1.29.x is the last line that works.
-# dependencies = ["mcp>=1.9,<2", "pyyaml"]
+# # mcp 2.x: FastMCP became mcp.server.mcpserver.MCPServer. Ported and checked
+# # on 2.3.0 against a recording made on 1.30.0 (evals/checks/mcp_replay.py).
+# # The <3 ceiling is deliberate: the last major bump is what broke this file.
+# dependencies = ["mcp>=2.3,<3", "pyyaml"]
 # ///
 """Offload MCP server: three tools that move bulk token work onto local models.
 
@@ -22,6 +21,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -36,9 +36,17 @@ from pydantic import Field  # noqa: E402
 
 import harness_lib as h  # noqa: E402
 import workspace_index as wi  # noqa: E402
-from mcp.server.fastmcp import Context, FastMCP  # noqa: E402
-from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
+from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from mcp.types import ToolAnnotations  # noqa: E402
+from mcp import MCPDeprecationWarning  # noqa: E402
+
+# ctx.info() is the MCP logging capability. SEP-2577 deprecated it in the
+# 2026-07-28 spec, but it is advisory: no wire change, and clients still get the
+# notifications. It is how index progress reaches the user, so keep using it --
+# without a deprecation line on stderr for every progress message. Revisit when
+# the SDK removes it (the replay check will fail loudly when that happens).
+warnings.filterwarnings("ignore", category=MCPDeprecationWarning)
 
 # Local models are slow and that is fine -- the whole point is that this work
 # is free. Timeouts are generous so a cold model load does not look like a bug.
@@ -60,7 +68,7 @@ All three run against local models through a LiteLLM proxy on localhost. They
 cost nothing but wall-clock time, so prefer them over doing the same work
 inline. If the proxy is down every tool says so and names the fix."""
 
-mcp = FastMCP("harness-offload", instructions=SERVER_INSTRUCTIONS)
+mcp = MCPServer("harness-offload", instructions=SERVER_INSTRUCTIONS)
 
 
 # --------------------------------------------------------------------------
