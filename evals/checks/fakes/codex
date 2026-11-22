@@ -12,7 +12,8 @@ Covers exactly what mcp/delegate-server uses:
 In a workspace-write sandbox it writes ``DELEGATED-<n>.md`` into ``cwd`` so the
 caller has a diff to summarise. Knobs for concurrency/kill tests:
 FAKE_CODEX_SLEEP (seconds to hold each call), FAKE_CODEX_LOG (append one JSON
-line per call: pid, cwd, sandbox, file written).
+line per call: pid, cwd, sandbox, file written), FAKE_CODEX_PIDFILE (write the
+mcp-server pid at startup).
 """
 from __future__ import annotations
 
@@ -86,6 +87,9 @@ def handle_call(rid: int, name: str, args: dict) -> None:
 
 
 def mcp_server() -> int:
+    pidfile = os.environ.get("FAKE_CODEX_PIDFILE")
+    if pidfile:
+        Path(pidfile).write_text(str(os.getpid()))
     for line in sys.stdin:
         try:
             msg = json.loads(line)

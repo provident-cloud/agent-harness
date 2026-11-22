@@ -233,7 +233,10 @@ def normalise(value: Any, subs: list[tuple[str, str]]) -> Any:
     if isinstance(value, str):
         for old, new in subs:
             value = value.replace(old, new)
-        # Durations are wall-clock; everything else must be byte-stable.
+        # Durations, task ids and the harness's own commit shas are per-run;
+        # everything else must be byte-stable.
+        value = re.sub(r"delegate/\d{8}-\d{6}-[0-9a-f]{6}", "delegate/<TASK>", value)
+        value = re.sub(r"(commit |based on |HEAD |git diff )[0-9a-f]{12}\b", r"\1<SHA>", value)
         # workspace_search scores include a literal-match boost that depends on
         # whether ripgrep is installed; the ranking and snippets still count.
         value = re.sub(r"\(score -?\d+\.\d+\)", "(score <S>)", value)

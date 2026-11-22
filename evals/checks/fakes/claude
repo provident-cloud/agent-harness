@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -56,8 +57,13 @@ def main(argv: list[str]) -> int:
         return 3
     mode, model, resume = opt("--permission-mode"), opt("--model"), opt("--resume")
     cwd = Path.cwd()
-    state = cwd / ".git" / "fake-claude-sessions" if (cwd / ".git").is_dir() else None
-    # sessions are remembered per repo so --resume works across processes
+    # Sessions are remembered in the repo's common git dir, so --resume works
+    # across processes and from any worktree of the repo (like the real CLI,
+    # which finds a session by id from anywhere).
+    common = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--git-common-dir"],
+                            capture_output=True, text=True)
+    state = (cwd / common.stdout.strip() / "fake-claude-sessions").resolve() \
+        if common.returncode == 0 else None
     known: list[str] = []
     if state and state.exists():
         known = state.read_text().split()
