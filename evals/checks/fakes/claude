@@ -72,6 +72,18 @@ def main(argv: list[str]) -> int:
                           "result": f"No conversation found with session ID: {resume}",
                           "session_id": resume, "total_cost_usd": 0}))
         return 1
+    met = True
+    bdir, bcount = os.environ.get("FAKE_BARRIER_DIR"), int(os.environ.get("FAKE_BARRIER_COUNT") or 0)
+    if bdir and bcount >= 2:  # wait until the other concurrent fake has entered too
+        Path(bdir).mkdir(parents=True, exist_ok=True)
+        (Path(bdir) / str(os.getpid())).touch()
+        deadline = time.time() + 15
+        while len(list(Path(bdir).iterdir())) < bcount and time.time() < deadline:
+            time.sleep(0.1)
+        met = len(list(Path(bdir).iterdir())) >= bcount
+    pidfile = os.environ.get("FAKE_CODEX_PIDFILE")
+    if pidfile:
+        Path(pidfile).write_text(str(os.getpid()))
     delay = float(os.environ.get("FAKE_CLAUDE_SLEEP") or 0)
     if delay:
         time.sleep(delay)
@@ -87,7 +99,8 @@ def main(argv: list[str]) -> int:
     if log:
         with open(log, "a") as fh:
             fh.write(json.dumps({"pid": os.getpid(), "cwd": str(cwd), "sandbox": mode,
-                                 "written": written, "model": model, "cli": "claude"}) + "\n")
+                                 "written": written, "model": model, "cli": "claude",
+                                 "barrier_met": met}) + "\n")
     text = (f"fake claude: replied on {session}" if resume
             else f"fake claude: done in {mode} mode" + (" (model pinned)" if model else ""))
     print(json.dumps({

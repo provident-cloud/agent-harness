@@ -12,8 +12,10 @@ checkout has an uncommitted change in a tracked file:
 2. ends        SIGTERM to the server, SIGTERM to its `uv` wrapper, and the
                client closing stdin, each mid-task: the agent CLI is killed
                and no worktree is left.
-3. sigkill     SIGKILL mid-task leaves a stale worktree (nothing can run); the
-               next server start sweeps it.
+3. sigkill     SIGKILL mid-task leaves a stale worktree and an orphaned agent
+               (nothing can run); the next server start removes both.
+4. handoff     the task branch cannot be written: the call fails, the edits are
+               saved as a patch, the journal says not ok.
 
 Target tree: $HARNESS_EVAL_TARGET (bin/eval sets it), else the cwd.
 Exit 0 pass, 1 fail, 77 when uv is unavailable.
@@ -135,8 +137,10 @@ def main() -> int:
         log = tmp / "agents.jsonl"
 
         # 1. concurrent -------------------------------------------------------
-        srv = Server(target, root, tmp, {"FAKE_CODEX_SLEEP": "2", "FAKE_CLAUDE_SLEEP": "2",
-                                         "FAKE_CODEX_LOG": str(log)})
+        # Each fake waits at a barrier until the other has entered: if the server
+        # ran the two tasks one after the other, the barrier would time out.
+        srv = Server(target, root, tmp, {"FAKE_BARRIER_DIR": str(tmp / "barrier"),
+                                         "FAKE_BARRIER_COUNT": "2", "FAKE_CODEX_LOG": str(log)})
         t0 = time.time()
         srv.start_call(101, "delegate", {"task": "task A", "repo": "demo", "mode": "edit",
                                          "adapter": "codex"})
@@ -149,8 +153,9 @@ def main() -> int:
         check(overlapped, "concurrent: both tasks had their own worktree at the same time")
         check(len(got) == 2 and not any((g.get("result") or {}).get("isError") for g in got.values()),
               "concurrent: both edit tasks succeeded on a dirty checkout")
-        check(elapsed < 4 * 2 + 10, f"concurrent: ran in parallel ({elapsed:.1f}s for two 2s tasks)")
         entries = [json.loads(ln) for ln in log.read_text().splitlines()] if log.exists() else []
+        check(len(entries) == 2 and all(e.get("barrier_met") for e in entries),
+              f"concurrent: both agents were running at the same moment ({elapsed:.1f}s)")
         cwds = {e["cwd"] for e in entries}
         check(len(entries) == 2 and len(cwds) == 2 and all(str(wt_root) in c for c in cwds),
               "concurrent: each agent ran in a different task worktree, neither in the checkout")
@@ -214,14 +219,59 @@ def main() -> int:
         srv.s.close()
         check(stale.exists() and len(worktrees(repo)) == 2,
               "sigkill: the killed server left a stale worktree (expected: nothing can run)")
+        orphan = int(pidfile.read_text()) if pidfile.exists() else 0
+        check(orphan > 0 and alive(orphan),
+              "sigkill: the agent CLI outlived its server (expected: nothing stopped it)")
         srv = Server(target, root, tmp, {})  # a fresh start runs the sweep
         swept = wait_for(lambda: not stale.exists() and worktrees(repo) == [str(repo.resolve())], 15)
         srv.s.close()
         check(swept, "sigkill: the next server start swept the stale worktree")
-        if pidfile.exists():
-            child = int(pidfile.read_text())
-            if alive(child):
-                os.kill(child, signal.SIGKILL)  # orphaned by SIGKILL; not ours to leave
+        check(orphan > 0 and wait_for(lambda: not alive(orphan), 10),
+              "sigkill: the sweep also stopped the orphaned agent CLI")
+        if orphan and alive(orphan):
+            os.kill(orphan, signal.SIGKILL)  # do not leave it running if the check failed
+
+        # 3b. the target repo's hooks never run for harness git operations
+        hooks = repo / ".git" / "hooks"
+        marker = tmp / "hook-ran"
+        for hook in ("post-checkout", "prepare-commit-msg", "pre-commit"):
+            (hooks / hook).write_text(f"#!/bin/sh\necho {hook} >> {marker}\n")
+            (hooks / hook).chmod(0o755)
+        srv = Server(target, root, tmp, {})
+        srv.start_call(351, "delegate", {"task": "edit with hooks around", "repo": "demo",
+                                         "mode": "edit", "adapter": "codex"})
+        resp = srv.wait({351}).get(351, {})
+        srv.s.close()
+        for hook in ("post-checkout", "prepare-commit-msg", "pre-commit"):
+            (hooks / hook).unlink()
+        check("changes are on branch" in text_of(resp) and not marker.exists(),
+              "hooks: checkout and commit ran none of the repo's hooks"
+              + (f" (ran: {marker.read_text().split()})" if marker.exists() else ""))
+
+        # 4. handoff failure: the branch cannot be written (here: a signing
+        #    requirement that cannot be met). The edits must survive as a patch,
+        #    the call must fail, and the journal must not say ok.
+        git(repo, "config", "commit.gpgsign", "true")
+        git(repo, "config", "gpg.program", "false")
+        srv = Server(target, root, tmp, {})
+        srv.start_call(401, "delegate", {"task": "edit that cannot be committed", "repo": "demo",
+                                         "mode": "edit", "adapter": "codex"})
+        resp = srv.wait({401}).get(401, {})
+        srv.s.close()
+        git(repo, "config", "--unset", "commit.gpgsign")
+        git(repo, "config", "--unset", "gpg.program")
+        text = text_of(resp)
+        patches = list((root / "var" / "delegate-patches").glob("*.patch"))
+        check((resp.get("result") or {}).get("isError") is True and "could not be committed" in text,
+              "handoff: a failed branch write fails the call")
+        check(len(patches) == 1 and "DELEGATED-" in patches[0].read_text()
+              and str(patches[0]) in text,
+              "handoff: the edits were saved as a patch, and the error says where")
+        rows = [json.loads(ln) for ln in (root / "var" / "usage.jsonl").read_text().splitlines()]
+        last = [r_ for r_ in rows if r_.get("tool") == "delegate"][-1]
+        check(last.get("ok") is False and last.get("detail") == "handoff-failed",
+              "handoff: the journal records the failure, not ok")
+        check(worktrees(repo) == [str(repo.resolve())], "handoff: no worktree left")
     finally:
         httpd.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)

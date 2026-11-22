@@ -53,11 +53,12 @@
         },
         "result": {
           "isError": false,
+          "refs_verified": true,
           "structuredContent": {
-            "result": "fake codex: done in workspace-write sandbox\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-2.md\n\n--- changes are on branch delegate/<TASK> (commit <SHA>, based on <SHA>) ---\nreview: git diff <SHA>..delegate/<TASK>\ntake:   git merge --ff-only delegate/<TASK>   (or cherry-pick it)\n\n(worked from demo HEAD <SHA> in a worktree that is now removed; uncommitted changes in your checkout were not visible to it)\n\nthreadId: thread-2  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 34 out]"
+            "result": "fake codex: done in workspace-write sandbox\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-2.md\n\n--- changes are on branch delegate/<TASK> (commit <SHA>, based on <SHA>) ---\nreview: git diff <SHA>..delegate/<TASK>\ntest:   git switch --detach delegate/<TASK> && <your checks>   (no hooks ran on it)\ntake:   git merge --ff-only delegate/<TASK>   (or cherry-pick it)\n\n(worked from demo HEAD <SHA> in a worktree that is now removed; uncommitted changes in your checkout were not visible to it)\n\nthreadId: thread-2  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 34 out]"
           },
           "text": [
-            "fake codex: done in workspace-write sandbox\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-2.md\n\n--- changes are on branch delegate/<TASK> (commit <SHA>, based on <SHA>) ---\nreview: git diff <SHA>..delegate/<TASK>\ntake:   git merge --ff-only delegate/<TASK>   (or cherry-pick it)\n\n(worked from demo HEAD <SHA> in a worktree that is now removed; uncommitted changes in your checkout were not visible to it)\n\nthreadId: thread-2  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 34 out]"
+            "fake codex: done in workspace-write sandbox\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-2.md\n\n--- changes are on branch delegate/<TASK> (commit <SHA>, based on <SHA>) ---\nreview: git diff <SHA>..delegate/<TASK>\ntest:   git switch --detach delegate/<TASK> && <your checks>   (no hooks ran on it)\ntake:   git merge --ff-only delegate/<TASK>   (or cherry-pick it)\n\n(worked from demo HEAD <SHA> in a worktree that is now removed; uncommitted changes in your checkout were not visible to it)\n\nthreadId: thread-2  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 34 out]"
           ]
         },
         "tool": "delegate"
@@ -88,7 +89,7 @@
         "result": {
           "isError": true,
           "text": [
-            "Error executing tool delegate_reply: Session not found for thread_id -- delegated sessions live only as long as this MCP server process. Start a fresh delegate call and include the needed context in the task brief."
+            "Error executing tool delegate_reply: unknown threadId 'thread-unknown': this server process did not start it. A delegated session can only be continued by the server that started it (it knows the session's repo, worktree and sandbox). Start a fresh delegate call and include the needed context in the task brief."
           ]
         },
         "tool": "delegate_reply"
@@ -102,11 +103,12 @@
         },
         "result": {
           "isError": false,
+          "refs_verified": true,
           "structuredContent": {
-            "result": "fake claude: done in acceptEdits mode\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-claude-1.md\n\n--- changes are on branch delegate/<TASK> (commit <SHA>, based on <SHA>) ---\nreview: git diff <SHA>..delegate/<TASK>\ntake:   git merge --ff-only delegate/<TASK>   (or cherry-pick it)\n\n(worked from demo HEAD <SHA> in a worktree that is now removed; uncommitted changes in your checkout were not visible to it)\n\nthreadId: session-1  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
+            "result": "fake claude: done in acceptEdits mode\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-claude-1.md\n\n--- changes are on branch delegate/<TASK> (commit <SHA>, based on <SHA>) ---\nreview: git diff <SHA>..delegate/<TASK>\ntest:   git switch --detach delegate/<TASK> && <your checks>   (no hooks ran on it)\ntake:   git merge --ff-only delegate/<TASK>   (or cherry-pick it)\n\n(worked from demo HEAD <SHA> in a worktree that is now removed; uncommitted changes in your checkout were not visible to it)\n\nthreadId: session-1  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
           },
           "text": [
-            "fake claude: done in acceptEdits mode\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-claude-1.md\n\n--- changes are on branch delegate/<TASK> (commit <SHA>, based on <SHA>) ---\nreview: git diff <SHA>..delegate/<TASK>\ntake:   git merge --ff-only delegate/<TASK>   (or cherry-pick it)\n\n(worked from demo HEAD <SHA> in a worktree that is now removed; uncommitted changes in your checkout were not visible to it)\n\nthreadId: session-1  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
+            "fake claude: done in acceptEdits mode\n\n--- diff summary ---\n(no tracked changes)\nnew untracked files: DELEGATED-claude-1.md\n\n--- changes are on branch delegate/<TASK> (commit <SHA>, based on <SHA>) ---\nreview: git diff <SHA>..delegate/<TASK>\ntest:   git switch --detach delegate/<TASK> && <your checks>   (no hooks ran on it)\ntake:   git merge --ff-only delegate/<TASK>   (or cherry-pick it)\n\n(worked from demo HEAD <SHA> in a worktree that is now removed; uncommitted changes in your checkout were not visible to it)\n\nthreadId: session-1  (continue with delegate_reply)\n\n[frontier spend logged to usage journal -- tokens: 1200 in / 40 out, cost: $0.0123]"
           ]
         },
         "tool": "delegate"
@@ -267,18 +269,6 @@
         "ok": true,
         "prompt_tokens": 300,
         "route": "frontier",
-        "tool": "delegate_reply"
-      },
-      {
-        "adapter": "codex",
-        "alias": "codex",
-        "detail": "session-not-found",
-        "fallback": false,
-        "model_alias": "frontier-default",
-        "model_resolved": "codex-default",
-        "ok": false,
-        "route": "frontier",
-        "tokens_reported": false,
         "tool": "delegate_reply"
       },
       {
