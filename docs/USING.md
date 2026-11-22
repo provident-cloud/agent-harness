@@ -143,6 +143,21 @@ bills your subscription login: it drops `ANTHROPIC_API_KEY` from the child
 unless `delegate: {allow_api_key: true}`. It runs `--restricted`, so it edits
 but never runs commands -- pick `codex` when the task needs tests run.
 
+**Delegated tasks never touch your checkout.** Each one runs in a fresh git
+worktree of the repo at `HEAD`, so you can keep working (dirty tree and all)
+and run two delegated tasks on the same repo at once. An edit task's changes
+come back on a `delegate/<task-id>` branch, named in the result:
+
+```sh
+git diff <base>..delegate/<task-id>     # review
+git merge --ff-only delegate/<task-id>  # take it (or cherry-pick)
+git branch -D delegate/<task-id>        # or drop it
+```
+
+The delegate sees committed code only -- commit first if it needs your latest
+change. The worktree is removed however the task ends; if the server was
+SIGKILLed, the next start removes it and says so on stderr.
+
 ## Choosing a tool
 
 A decision list, not a feature tour.

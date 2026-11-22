@@ -28,7 +28,9 @@ is the changelog. Beyond the original design:
 - **Frontier delegation** (`mcp/delegate-server/`): hands scoped tasks to an
   agent CLI through an adapter (`codex` or `claude`; same task in, same result
   out). Model is a delegate alias from `DELEGATE_MODELS` in `lib/harness_lib.py`;
-  `bin/local delegate-check` refuses a pair that cannot work. Every call
+  `bin/local delegate-check` refuses a pair that cannot work. Each task runs in
+  its own git worktree (`mcp/delegate-server/worktrees.py`) and returns edits on
+  a `delegate/<task-id>` branch. Every call
   journaled as `route=frontier` with `adapter`, `model_alias`, and `cost_usd`
   when the CLI reports it.
 - **Response caching**: LiteLLM disk cache (24h TTL, `var/litellm-cache`) plus

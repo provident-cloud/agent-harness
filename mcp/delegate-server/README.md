@@ -15,8 +15,15 @@ Guarantees the wrapper adds on top of raw `codex mcp-server`:
 
 - **Repo scoping** -- sessions run with `cwd` pinned to one configured repo;
   anything else is refused.
-- **Clean-tree gate** -- `edit` mode refuses if the repo has modified tracked
-  files. Delegate never edits over uncommitted work.
+- **A fresh worktree per task** -- every task runs in its own detached git
+  worktree of the repo at HEAD (`var/delegate-worktrees/<task-id>/tree`), never
+  in your checkout, which may be dirty. Edits come back committed (by the
+  harness, `--no-verify`) on a `delegate/<task-id>` branch; the worktree is
+  removed when the task ends -- normally, on error, timeout or cancellation, on
+  SIGTERM/SIGHUP/SIGINT of the server, and when the client goes away. SIGKILL
+  cannot be caught: the next server start sweeps worktrees whose owner process
+  (pid + start time) is gone. `delegate_reply` recreates the same worktree path
+  from the task's branch. The clean-tree check applies to that worktree.
 - **No environment sprawl** -- the user's personal Codex MCP servers (Slack,
   GitHub, ...) are enumerated via `codex mcp list --json` and disabled for
   the child session. A delegated task gets the repo and a shell, nothing else.
