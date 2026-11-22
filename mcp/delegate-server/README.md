@@ -30,14 +30,25 @@ Guarantees the wrapper adds on top of raw `codex mcp-server`:
 | Adapter | Runs | edit mode | review mode | follow-ups |
 |---|---|---|---|---|
 | `codex` | one shared `codex mcp-server` child | `workspace-write` sandbox | `read-only` sandbox | threads live in the child process |
-| `claude` | one `claude -p --output-format json` per call | `--permission-mode acceptEdits` | `--permission-mode plan` | `--resume <session_id>` |
+| `claude` | one `claude -p --output-format json --restricted` per call | `--permission-mode acceptEdits` | `--permission-mode plan` | `--resume <session_id>` |
 
 Both get `--permission-prompts none` / `approval-policy never` (nobody can
 answer a prompt) and no personal MCP servers (`--strict-mcp-config` for
-Claude Code, per-server disables for Codex). One difference to know: under
-`acceptEdits`, Claude Code writes files but is denied shell commands outside
-its read-only set unless your own `permissions.allow` covers them, so it may
-not run your tests where Codex's sandbox would.
+Claude Code, per-server disables for Codex). Claude Code also runs
+`--restricted`: no Bash or other code-running tools, file tools confined to
+the working directory, and no user/project/local settings files -- so a target
+repo's `.claude/settings.json` hooks never run with your permissions. The
+cost: a Claude edit session edits files but cannot run your tests, where
+Codex's sandbox can. Needs Claude Code 2.1.259+ (checked).
+
+**Billing.** `ANTHROPIC_API_KEY` is removed from the Claude child's
+environment, so it bills your subscription login. Set
+`delegate: {allow_api_key: true}` in `config/harness.yaml` to let it use the
+key (API billing) instead.
+
+**The journal never stores CLI output.** A failed call is journaled with a
+fixed reason (`auth`, `timeout`, `error-result-exit-1`, `no-result-exit-3`,
+...) and whatever tokens/cost the failed run reported.
 
 `model` is a **delegate model alias**, never a concrete name. The mapping lives
 in `lib/harness_lib.py` (`DELEGATE_MODELS`) and can be extended per team in

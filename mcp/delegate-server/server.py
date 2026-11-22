@@ -171,7 +171,26 @@ def _resolve_runner(adapter: str, model: str) -> tuple[str, str, str | None]:
     problem = h.delegate_combo_problem(adapter, alias, models)
     if problem:
         raise ToolError(problem)
+    cli_problem = _cli_problem(adapter)
+    if cli_problem:
+        raise ToolError(f"the {adapter} adapter cannot run here: {cli_problem}")
+    section = h.load_config(required=False).raw.get("delegate") or {}
+    ADAPTERS["claude"].allow_api_key = bool(isinstance(section, dict)
+                                            and section.get("allow_api_key") is True)
     return adapter, alias, models[alias][adapter]
+
+
+_CLI_OK: set[str] = set()
+
+
+def _cli_problem(adapter: str) -> str:
+    """PATH + minimum-version check, remembered once it passes (per process)."""
+    if adapter in _CLI_OK:
+        return ""
+    problem = h.delegate_cli_problem(adapter)
+    if not problem:
+        _CLI_OK.add(adapter)
+    return problem
 
 
 # Follow-ups must go back to the adapter (and repo, mode, model) that started the
@@ -180,7 +199,9 @@ _THREADS: dict[str, dict[str, Any]] = {}
 
 
 def _log_delegate(tool: str, *, adapter: str, alias: str, concrete: str | None, ok: bool,
-                  started: float, result: Result | None, detail: str = "") -> None:
+                  started: float, result: Result | None, reason: str = "") -> None:
+    """One journal row. ``reason`` is a fixed failure category, never CLI text:
+    error messages can quote anything a CLI printed, and the journal is on disk."""
     record: dict[str, Any] = dict(
         tool=tool,
         alias=adapter,  # usage-report groups by this; it was always the CLI name
@@ -200,8 +221,8 @@ def _log_delegate(tool: str, *, adapter: str, alias: str, concrete: str | None, 
         record["tokens_reported"] = False
     if result is not None and result.cost_usd is not None:
         record["cost_usd"] = result.cost_usd
-    if detail:
-        record["detail"] = detail[:200]
+    if reason:
+        record["detail"] = reason[:60]
     h.log_usage(**record)
 
 
@@ -299,7 +320,7 @@ async def delegate(
         result = await ADAPTERS[adapter_name].run(job)
     except AdapterError as exc:
         _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
-                      ok=False, started=started, result=None, detail=str(exc))
+                      ok=False, started=started, result=exc.result, reason=exc.reason)
         raise ToolError(str(exc)) from exc
 
     _log_delegate("delegate", adapter=adapter_name, alias=alias, concrete=concrete,
@@ -351,8 +372,8 @@ async def delegate_reply(
         result = await ADAPTERS[adapter_name].reply(thread_id, job)
     except AdapterError as exc:
         _log_delegate("delegate_reply", adapter=adapter_name, alias=known["alias"],
-                      concrete=known["concrete"], ok=False, started=started, result=None,
-                      detail=str(exc))
+                      concrete=known["concrete"], ok=False, started=started,
+                      result=exc.result, reason=exc.reason)
         raise ToolError(str(exc)) from exc
     _log_delegate("delegate_reply", adapter=adapter_name, alias=known["alias"],
                   concrete=known["concrete"], ok=True, started=started, result=result)

@@ -32,7 +32,18 @@ from typing import Any
 
 
 class AdapterError(Exception):
-    """A failure the caller should read as-is: what broke and the fix."""
+    """A failure the caller should read as-is: what broke and the fix.
+
+    ``reason`` is a short fixed category for the usage journal (auth, timeout,
+    exit-1, no-result, ...): the message itself can quote CLI output, which
+    may carry anything, so it goes to the caller but never to disk. ``result``
+    carries tokens/cost when a failed run still reported them.
+    """
+
+    def __init__(self, message: str, reason: str = "error", result: "Result | None" = None):
+        super().__init__(message)
+        self.reason = reason
+        self.result = result
 
 
 @dataclass
@@ -107,6 +118,19 @@ def _friendly_codex_error(text: str) -> str:
             "in a terminal, then retry."
         )
     return text.strip() or "codex session failed with no message"
+
+
+def _codex_reason(message: str) -> str:
+    low = message.lower()
+    if "not authenticated" in low:
+        return "auth"
+    if "exceeded" in low:
+        return "timeout"
+    if "not on path" in low:
+        return "cli-missing"
+    if "session not found" in low:
+        return "session-not-found"
+    return "error-result"
 
 
 class _CodexChild:
@@ -377,13 +401,21 @@ class CodexAdapter:
         }
         if task.model:
             arguments["model"] = task.model
-        text, thread_id, events = await _run_codex_tool("codex", arguments, task.timeout_s)
+        try:
+            text, thread_id, events = await _run_codex_tool("codex", arguments, task.timeout_s)
+        except AdapterError as exc:
+            exc.reason = _codex_reason(str(exc))
+            raise
         return self._result(text, thread_id, events)
 
     async def reply(self, thread_id: str, task: Task) -> Result:
-        text, thread_out, events = await _run_codex_tool(
-            "codex-reply", {"threadId": thread_id, "prompt": task.prompt}, task.timeout_s
-        )
+        try:
+            text, thread_out, events = await _run_codex_tool(
+                "codex-reply", {"threadId": thread_id, "prompt": task.prompt}, task.timeout_s
+            )
+        except AdapterError as exc:
+            exc.reason = _codex_reason(str(exc))
+            raise
         return self._result(text, thread_out, events)
 
     @staticmethod
@@ -405,38 +437,66 @@ class CodexAdapter:
 # --------------------------------------------------------------------------
 # Claude Code: one `claude -p --output-format json` process per call.
 #
-# Flags, checked against `claude --help` (2.1.330) and the headless docs:
+# Flags, checked against `claude --help` (2.1.330) and the headless docs, and
+# probed live (review mode, a scratch repo):
+#   --restricted                           no Bash or other code-running tools,
+#                                          file tools confined to cwd, and no
+#                                          user/project/local settings -- so a
+#                                          target repo's .claude/settings.json
+#                                          hooks never run with the operator's
+#                                          permissions
 #   --permission-mode acceptEdits | plan   edit may write files in cwd; review
 #                                          is read-only (plan mode)
 #   --permission-prompts none              nobody can answer a prompt; deny it
 #                                          and tell the model not to retry
+#                                          (needs 2.1.259+, checked up front)
 #   --strict-mcp-config                    with no --mcp-config: no MCP servers,
-#                                          the same sprawl guard as Codex gets
+#                                          including the repo's .mcp.json
 #   --append-system-prompt                 the developer brief
 #   --resume <session_id>                  delegate_reply
 # Not --bare: bare mode never reads the subscription login, only an API key.
-# The JSON result carries result, session_id, is_error, usage, total_cost_usd.
-# A run with no USER in its environment answers is_error "Not logged in" at $0
-# (see AGENTS.md); that is surfaced as an error, never as an empty success.
+# ANTHROPIC_API_KEY is removed from the child's environment unless
+# config/harness.yaml sets delegate.allow_api_key: true, because with it present
+# Claude Code bills the API instead of the subscription.
+# The JSON result carries type=result, subtype, is_error, result, session_id,
+# usage, total_cost_usd. Success needs exit 0 AND that envelope with
+# subtype=success; anything else is an error (with its spend kept if reported).
 # --------------------------------------------------------------------------
 
 
-def _claude_error(text: str) -> str:
+def _claude_error(text: str) -> tuple[str, str]:
+    """(message for the caller, journal reason)."""
     low = text.lower()
     if "not logged in" in low or "login" in low or "authenticat" in low:
-        return (f"Claude Code is not authenticated: {text.strip()} -- run `claude` once in a "
-                "terminal (and make sure USER is set in the server's environment), then retry.")
-    return text.strip() or "claude session failed with no message"
+        return (f"Claude Code is not authenticated: {text.strip()[:300]} -- run `claude` once in "
+                "a terminal (and make sure USER is set in the server's environment; if you "
+                "rely on an API key, set delegate.allow_api_key: true), then retry.", "auth")
+    return text.strip()[:600] or "claude session failed with no message", "error-result"
+
+
+def _usage_into(res: "Result", data: dict[str, Any]) -> None:
+    usage = data.get("usage") or {}
+    if isinstance(usage, dict) and usage:
+        res.prompt_tokens = sum(int(usage.get(k) or 0) for k in (
+            "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        res.completion_tokens = int(usage.get("output_tokens") or 0)
+    if data.get("total_cost_usd") is not None:
+        try:
+            res.cost_usd = float(data["total_cost_usd"])
+        except (TypeError, ValueError):
+            pass
 
 
 class ClaudeAdapter:
     """Claude Code CLI in headless mode, one process per call."""
 
     name = "claude"
+    allow_api_key = False  # set from config by the server
 
     def argv(self, task: Task, resume: str = "") -> list[str]:
         argv = [
             "claude", "-p", "--output-format", "json",
+            "--restricted",
             "--permission-mode", "acceptEdits" if task.mode == "edit" else "plan",
             "--permission-prompts", "none",
             "--strict-mcp-config",
@@ -448,6 +508,12 @@ class ClaudeAdapter:
             argv += ["--resume", resume]
         return argv + ["--", task.prompt]
 
+    def env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        if not self.allow_api_key:
+            env.pop("ANTHROPIC_API_KEY", None)
+        return env
+
     async def run(self, task: Task) -> Result:
         return await self._exec(task, "")
 
@@ -457,10 +523,11 @@ class ClaudeAdapter:
     async def _exec(self, task: Task, resume: str) -> Result:
         if shutil.which("claude") is None:
             raise AdapterError("the `claude` CLI is not on PATH. Install Claude Code and log "
-                               "in once (`claude`), then retry.")
+                               "in once (`claude`), then retry.", reason="cli-missing")
         proc = await asyncio.create_subprocess_exec(
             *self.argv(task, resume),
             cwd=str(task.cwd),
+            env=self.env(),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -471,27 +538,27 @@ class ClaudeAdapter:
         except asyncio.TimeoutError as exc:
             await _kill_group(proc)
             raise AdapterError(
-                f"the delegated session exceeded {task.timeout_s}s and was stopped. Check "
-                "`git status` in the repo; retry with a smaller task or a longer timeout_s."
+                f"the delegated session exceeded {task.timeout_s}s and was stopped. Retry "
+                "with a smaller task or a longer timeout_s.", reason="timeout"
             ) from exc
         except asyncio.CancelledError:
             await _kill_group(proc)
             raise
+        await _kill_group(proc)  # leader exited; reap anything it left in its group
         data = _last_json(out.decode(errors="replace"))
-        if data is None:
-            detail = (err.decode(errors="replace") or out.decode(errors="replace")).strip()[-400:]
-            raise AdapterError(_claude_error(
-                f"claude exited {proc.returncode} without a JSON result: {detail}"))
-        if data.get("is_error") or data.get("subtype") not in (None, "success"):
-            raise AdapterError(_claude_error(str(data.get("result") or data.get("subtype") or "")))
-        usage = data.get("usage") or {}
-        res = Result(text=str(data.get("result") or ""), thread_id=str(data.get("session_id") or ""))
-        if usage:
-            res.prompt_tokens = sum(int(usage.get(k) or 0) for k in (
-                "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-            res.completion_tokens = int(usage.get("output_tokens") or 0)
-        if data.get("total_cost_usd") is not None:
-            res.cost_usd = float(data["total_cost_usd"])
+        envelope = isinstance(data, dict) and data.get("type") == "result"
+        res = Result(text="")
+        if envelope:
+            _usage_into(res, data)
+        if not envelope:
+            detail = (err.decode(errors="replace") or out.decode(errors="replace")).strip()[-300:]
+            raise AdapterError(f"claude exited {proc.returncode} without a result: {detail}",
+                               reason=f"no-result-exit-{proc.returncode}")
+        if proc.returncode != 0 or data.get("is_error") or data.get("subtype") != "success":
+            msg, reason = _claude_error(str(data.get("result") or data.get("subtype") or ""))
+            raise AdapterError(msg, reason=f"{reason}-exit-{proc.returncode}", result=res)
+        res.text = str(data.get("result") or "")
+        res.thread_id = str(data.get("session_id") or "")
         denials = data.get("permission_denials") or []
         if denials:
             res.warnings.append(f"note: {len(denials)} tool call(s) were denied (no one can "
@@ -500,7 +567,9 @@ class ClaudeAdapter:
 
 
 def _last_json(text: str) -> dict[str, Any] | None:
-    for line in reversed(text.strip().splitlines()):
+    """The last JSON object on stdout, preferring a type=result envelope."""
+    objs: list[dict[str, Any]] = []
+    for line in text.strip().splitlines():
         line = line.strip()
         if line.startswith("{"):
             try:
@@ -508,28 +577,53 @@ def _last_json(text: str) -> dict[str, Any] | None:
             except json.JSONDecodeError:
                 continue
             if isinstance(obj, dict):
-                return obj
+                objs.append(obj)
+    if not objs:
+        try:
+            obj = json.loads(text)
+            objs = [obj] if isinstance(obj, dict) else []
+        except json.JSONDecodeError:
+            return None
+    for obj in reversed(objs):
+        if obj.get("type") == "result":
+            return obj
+    return objs[-1] if objs else None
+
+
+def _group_alive(pgid: int) -> bool:
     try:
-        obj = json.loads(text)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 async def _kill_group(proc: asyncio.subprocess.Process) -> None:
-    """SIGTERM the child's process group, then SIGKILL after 5s."""
-    if proc.returncode is not None:
-        return
-    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+    """Make sure nothing in the child's process group survives.
+
+    Checked against the group, not the leader: the leader can exit while a
+    descendant (a test run, a language server) keeps going. SIGTERM, wait up to
+    5s for the group to empty, then SIGKILL.
+    """
+    pgid = proc.pid
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not _group_alive(pgid):
+            break
         try:
-            os.killpg(proc.pid, sig)
+            os.killpg(pgid, sig)
         except ProcessLookupError:
-            return
+            break
+        for _ in range(50):
+            if not _group_alive(pgid):
+                break
+            await asyncio.sleep(0.1)
+    if proc.returncode is None:
         try:
-            await asyncio.wait_for(proc.wait(), timeout=wait)
-            return
+            await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:
-            continue
+            pass
 
 
 ADAPTERS: dict[str, Any] = {"codex": CodexAdapter(), "claude": ClaudeAdapter()}
