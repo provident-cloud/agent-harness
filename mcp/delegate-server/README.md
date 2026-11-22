@@ -1,7 +1,8 @@
 # Delegate server
 
-Frontier handoff: two MCP tools that run a scoped task in a Codex CLI session
-on the user's own OpenAI subscription. The mirror image of the offload server
+Frontier handoff: two MCP tools that run a scoped task in an agent CLI session
+on the user's own subscription -- Codex CLI or Claude Code, behind one adapter
+interface (`adapters.py`: same `Task` in, same `Result` out). The mirror image of the offload server
 -- that one moves bulk work to cheap local models; this one buys extra
 frontier capacity, explicitly and accounted for.
 
@@ -24,9 +25,45 @@ Guarantees the wrapper adds on top of raw `codex mcp-server`:
   metered spend. Measured while building this: a trivial review session cost
   ~36k input tokens. Delegation is not cheap; that is why it is visible.
 
+## Adapters and model aliases
+
+| Adapter | Runs | edit mode | review mode | follow-ups |
+|---|---|---|---|---|
+| `codex` | one shared `codex mcp-server` child | `workspace-write` sandbox | `read-only` sandbox | threads live in the child process |
+| `claude` | one `claude -p --output-format json` per call | `--permission-mode acceptEdits` | `--permission-mode plan` | `--resume <session_id>` |
+
+Both get `--permission-prompts none` / `approval-policy never` (nobody can
+answer a prompt) and no personal MCP servers (`--strict-mcp-config` for
+Claude Code, per-server disables for Codex). One difference to know: under
+`acceptEdits`, Claude Code writes files but is denied shell commands outside
+its read-only set unless your own `permissions.allow` covers them, so it may
+not run your tests where Codex's sandbox would.
+
+`model` is a **delegate model alias**, never a concrete name. The mapping lives
+in `lib/harness_lib.py` (`DELEGATE_MODELS`) and can be extended per team in
+`config/tier-overrides.yaml`:
+
+```yaml
+delegate_models:
+  frontier-deep:
+    codex: <a codex model id>
+```
+
+The default pair comes from `config/harness.yaml`:
+
+```yaml
+delegate:
+  adapter: codex          # or claude
+  model: frontier-default # the CLI's own default model
+```
+
+A pair that cannot work (a local alias, a concrete name, an alias with no
+mapping for that adapter) is refused before anything runs, at three points:
+`bin/local delegate-check`, `bin/local health`, and every `delegate` call.
+
 ## Requirements
 
-- Codex CLI on PATH, authenticated (`codex login`).
+- The adapter's CLI on PATH and logged in: `codex login`, or `claude` once.
 - An initialised harness (`bin/init`) -- repo scoping reads `config/`.
 
 ## Registration and debugging

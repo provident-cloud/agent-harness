@@ -131,6 +131,14 @@ it sends `io.modelcontextprotocol/logLevel` (e.g. `info`) in the request's
 `_meta`. The result is the same either way; only the progress is silent.
 `mcp-modern` pins this.
 
+**Delegation has adapters now.** `delegate` takes `adapter` (`codex` or
+`claude`) and `model`, which is a **delegate alias** such as `frontier-default`
+(the CLI's own default). A concrete model id is refused, so is a local alias,
+so is an alias with no mapping for that adapter -- the error lists the ones that
+work. `bin/local delegate-check` shows the configured pair and which alias runs
+where; `bin/local health` runs the same check. Map more aliases per team in
+`config/tier-overrides.yaml` under `delegate_models:`.
+
 ## Choosing a tool
 
 A decision list, not a feature tour.
@@ -143,7 +151,7 @@ A decision list, not a feature tour.
 | Ask "where is this handled?" across repos | `workspace_search` (MCP), or `bin/local search <query>`. Needs a fresh index. |
 | Write a commit message, PR body, or changelog | `draft` (MCP), or `bin/local draft commit`. Better: install the git hook once per repo and never think about it again — `ln -sf <harness>/claude/hooks/commit-msg-local.sh .git/hooks/prepare-commit-msg`. It prefills from the staged diff and can never fail a commit. |
 | Get a first pass over a PR without reading it yourself | Workspace root → `/review-pr <n>`. `local-big` reads; you read the findings. |
-| Work two repos at once, or get a second frontier opinion | Workspace root → `/delegate <repo> <task>`. **Metered** on your OpenAI subscription, journaled as `route=frontier`. A trivial delegated review measured ~36k input tokens. |
+| Work two repos at once, or get a second frontier opinion | Workspace root → `/delegate <repo> <task>`. Runs on Codex or Claude Code (`adapter:`; default from `config/harness.yaml` `delegate:`). **Metered** on that CLI's subscription, journaled as `route=frontier` with adapter, model alias and cost. A trivial delegated review measured ~36k input tokens. |
 
 **One honest note.** In the journal's whole life, `compress_context` and `draft`
 have **zero MCP invocations** — the work went through `bin/local summarize` and
