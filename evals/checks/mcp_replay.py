@@ -236,7 +236,8 @@ def tool_entry(tool: dict[str, Any]) -> dict[str, Any]:
 
 def call_entry(resp: dict[str, Any], notes: list[dict]) -> dict[str, Any]:
     if "error" in resp:
-        out: dict[str, Any] = {"jsonrpc_error": resp["error"].get("message")}
+        out: dict[str, Any] = {"jsonrpc_error": {"code": resp["error"].get("code"),
+                                                 "message": resp["error"].get("message")}}
     else:
         result = resp["result"]
         out = {
@@ -245,9 +246,11 @@ def call_entry(resp: dict[str, Any], notes: list[dict]) -> dict[str, Any]:
         }
         if "structuredContent" in result:
             out["structuredContent"] = result["structuredContent"]
-    logs = [n.get("params", {}).get("data") for n in notes if n.get("method") == "notifications/message"]
-    if logs:
-        out["log_messages"] = logs
+    if notes:
+        # Full params (level, logger, data), not just the text: a severity
+        # change is client-visible too.
+        out["notifications"] = [{"method": n.get("method"), "params": n.get("params")}
+                                for n in notes]
     return out
 
 
@@ -259,8 +262,16 @@ def replay_server(name: str, server: Path, target: Path) -> dict[str, Any]:
     session = None
     try:
         root, ws = build_root(tmp, target, port)
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("HARNESS_", "OSS_"))}
+        # Never hand the fake a real credential, and never let a proxy setting
+        # route the loopback fake through anything.
+        drop = ("HARNESS_", "OSS_", "LITELLM_", "ANTHROPIC_", "OPENAI_")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(drop) and k.lower() not in
+               ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
         env.update({
+            "LITELLM_MASTER_KEY": "sk-replay-dummy",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
             "HARNESS_ROOT": str(root),
             "PATH": f"{HERE / 'fakes'}{os.pathsep}{os.environ.get('PATH', '')}",
             "CODEX_HOME": str(tmp / "codex-home"),
@@ -281,6 +292,7 @@ def replay_server(name: str, server: Path, target: Path) -> dict[str, Any]:
             "initialize": {
                 "name": info.get("serverInfo", {}).get("name"),
                 "instructions": info.get("instructions"),
+                "protocolVersion": info.get("protocolVersion"),
                 "capabilities": sorted((info.get("capabilities") or {}).keys()),
             },
             "tools": sorted((tool_entry(t) for t in tools["result"]["tools"]),
@@ -328,9 +340,15 @@ def mcp_pin(server: Path) -> str:
 
 
 def pin_allows_only_major(spec: str, major: int) -> bool:
-    lower = re.search(r">=\s*(\d+)", spec)
-    upper = re.search(r"<\s*(\d+)(?!\.)", spec)
-    return bool(lower and upper and int(lower.group(1)) == major and int(upper.group(1)) == major + 1)
+    """True when ``spec`` is exactly a >=<major>[.x] floor and a <<major+1>[.0] ceiling."""
+    clauses = [c.strip() for c in spec[3:].split(",")] if spec.startswith("mcp") else []
+    lower = [c for c in clauses if c.startswith(">=")]
+    upper = [c for c in clauses if c.startswith("<") and not c.startswith("<=")]
+    if len(lower) != 1 or len(upper) != 1 or len(clauses) != 2:
+        return False
+    lo = re.fullmatch(r">=\s*(\d+)(\.\d+)*", lower[0])
+    hi = re.fullmatch(r"<\s*(\d+)(\.0+)*", upper[0])
+    return bool(lo and hi and int(lo.group(1)) == major and int(hi.group(1)) == major + 1)
 
 
 def main() -> int:
