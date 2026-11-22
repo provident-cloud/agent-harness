@@ -44,8 +44,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEMPLATE="$ROOT/launchd/sh.adviser.harness.watch.plist.template"
-LABEL_PREFIX="sh.adviser.harness.watch"
+TEMPLATE="$ROOT/launchd/local.agent-harness.watch.plist.template"
+LABEL_PREFIX="local.agent-harness.watch"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 DOMAIN="gui/$(id -u)"
 
@@ -109,6 +109,30 @@ build_path() {
 # --- launchd helpers ---------------------------------------------------------
 
 label_for() { printf '%s.%s' "$LABEL_PREFIX" "$1"; }
+# Earlier versions used a different reverse-DNS prefix. A leftover job with the
+# same watch name would tick alongside the new one -- two billed runs per
+# interval -- so install removes it and list warns about any.
+legacy_plists() {
+  local f
+  for f in "$AGENTS_DIR"/*.harness.watch.*.plist; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in "$LABEL_PREFIX".*) continue ;; esac
+    printf '%s\n' "$f"
+  done
+  return 0
+}
+migrate_legacy() {
+  local name="$1" f label
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    label="$(basename "$f" .plist)"
+    [ "${label##*.harness.watch.}" = "$name" ] || continue
+    warn "found watch '$name' under a previous label: $label -- migrating it"
+    launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+    rm -f "$f"
+    ok "removed $f"
+  done < <(legacy_plists)
+}
 plist_for() { printf '%s/%s.%s.plist' "$AGENTS_DIR" "$LABEL_PREFIX" "$1"; }
 loaded()    { launchctl print "$DOMAIN/$(label_for "$1")" >/dev/null 2>&1; }
 
@@ -180,6 +204,7 @@ except Exception: print("ERR:unparseable output")' 2>/dev/null || echo "ERR:prob
 
   mkdir -p "$AGENTS_DIR" "$repo/.claude/dev-loop/log"
 
+  migrate_legacy "$name"
   local target; target="$(plist_for "$name")"
   if loaded "$name"; then
     dim "existing watch loaded; booting it out first"
@@ -245,6 +270,10 @@ cmd_list() {
     printf '  %-28s %s\n' "$name" "$(loaded "$name" && echo loaded || echo 'not loaded')"
   done
   [ "$found" = 1 ] || dim "no watches installed"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    warn "watch under a previous label: $f -- re-run install for it (it migrates)"
+  done < <(legacy_plists)
 }
 
 repo_of() {

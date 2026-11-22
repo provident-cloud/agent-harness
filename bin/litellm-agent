@@ -45,10 +45,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LABEL="sh.adviser.harness.litellm"
+LABEL="local.agent-harness.litellm"
 TEMPLATE="$ROOT/launchd/$LABEL.plist.template"
 TARGET="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
+# Earlier versions used a different reverse-DNS prefix for the same job. Any
+# plist ending in this suffix that is not $TARGET is that older install: it holds
+# :4000 and would make the new job crash-loop, so install migrates it and status
+# warns about it.
+LEGACY_DIR="$HOME/Library/LaunchAgents"
 
 C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
 ok()   { printf '%sok%s   %s\n'   "$C_OK"   "$C_OFF" "$*"; }
@@ -137,8 +142,29 @@ wait_healthy() {
   return 1
 }
 
+legacy_plists() {
+  local f
+  for f in "$LEGACY_DIR"/*.harness.litellm.plist; do
+    [ -f "$f" ] && [ "$f" != "$TARGET" ] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+migrate_legacy() {
+  local f label
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    label="$(basename "$f" .plist)"
+    warn "found an older install under a previous label: $label -- migrating it"
+    launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+    rm -f "$f"
+    ok "removed $f"
+  done < <(legacy_plists)
+}
+
 cmd_install() {
   require_template
+  migrate_legacy
   local path_value
   path_value="$(build_path)"
 
@@ -222,6 +248,11 @@ cmd_restart() {
 
 cmd_status() {
   printf 'plist      %s\n' "$([ -f "$TARGET" ] && echo "$TARGET" || echo '(not installed)')"
+  local legacy
+  while IFS= read -r legacy; do
+    [ -n "$legacy" ] || continue
+    warn "older install under a previous label: $legacy -- run: bin/litellm-agent install (it migrates)"
+  done < <(legacy_plists)
   if loaded; then
     local pid last
     pid="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^	pid = //p' | head -1)"

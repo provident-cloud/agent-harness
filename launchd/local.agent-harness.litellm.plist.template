@@ -22,7 +22,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>sh.adviser.harness.litellm</string>
+  <string>local.agent-harness.litellm</string>
 
   <key>ProgramArguments</key>
   <array>
