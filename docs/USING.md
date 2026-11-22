@@ -179,10 +179,17 @@ Set those in the environment the MCP server starts in. Attributes:
 `delegate.adapter`, `delegate.model_alias` (never the concrete model),
 `gen_ai.usage.input_tokens` / `output_tokens`, `delegate.cost_usd` when the CLI
 reports it, `delegate.duration_ms`, `delegate.outcome` and, on failure,
-`delegate.error_reason` with span status ERROR. A collector that is down never
-breaks a task: you get one `warn otel: span export failed` on stderr and an
-`otel-export` row in the journal. `bin/local delegate-check` shows whether it
-is on and where it sends.
+`delegate.error_reason` with span status ERROR, and `delegate.task_id`. A
+`delegate_reply` follow-up is its own span in the same trace as its task. A
+cancelled call is recorded too (`cancelled`).
+
+Export runs on a background thread, so a slow or dead collector never holds up
+a task: you get one `warn otel: span export failed` on stderr and an
+`otel-export` row in the journal (also when the collector answers 200 but
+rejects the span). Redirects are refused, and OTLP headers are only sent over
+https or to loopback. The agent CLIs never see the OTLP header variables.
+`bin/local delegate-check` (and `--json`) shows whether export is on and where
+it sends; `otel_traces: null` or any non-boolean is reported as a problem.
 
 ## Choosing a tool
 
