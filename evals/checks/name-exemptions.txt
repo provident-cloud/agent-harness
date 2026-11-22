@@ -1,0 +1,6 @@
+# (path, name-hash) pairs the name check tolerates. Never a whole file.
+# Read by evals/checks/no-names.py. Keep this list short and give each a reason.
+#
+# LICENSE: the copyright holder line is a legal notice, not instance content.
+LICENSE 6f9edcd3408cbda14a837e6a44fc5b7f64ccc9a2477c1498fcb13c777ffb9605
+LICENSE 8813536d83193565cebfb524df1e6f80fe5a8e17e3fa3b27ad31a09c9aea0fc8

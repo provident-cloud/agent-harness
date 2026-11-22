@@ -1,0 +1,19 @@
+# Harness self-checks for `bin/eval`. Unlike cases.yaml (per-team agent
+# stumbles, ships empty), these test the harness itself: deterministic, no
+# agent, no judge, no LiteLLM proxy. Safe for CI.
+#
+#   bin/eval --checks-only                     all checks against this checkout
+#   bin/eval --checks-only --rev origin/main   today's checks against an older tree
+#
+# Fields: id (unique), run (bash, cwd = the target tree; $HARNESS_ROOT is this
+# checkout, $HARNESS_EVAL_TARGET the tree under test), trap (what it guards),
+# timeout (seconds, default 900), enabled (false skips). Exit 0 passes, 77
+# skips (cannot run here), anything else fails.
+
+checks:
+  - id: no-org-names
+    run: python3 -I "$HARNESS_ROOT/evals/checks/no-names.py"
+    trap: >
+      A team, org, product or person name lands in a tracked file of this
+      public repo (path or content), including launchd labels.
+    timeout: 60
