@@ -379,6 +379,8 @@ def main() -> int:
         else:
             print(f"mcp-replay: {n}: {len(recorded[n]['tools'])} tools, "
                   f"{len(recorded[n]['calls'])} calls match the recording")
+    if failed:
+        print("mcp-replay: FAIL -- see the pin message and/or diff above")
     return 1 if failed else 0
 
 
