@@ -1,106 +1,146 @@
 #!/usr/bin/env python3
-"""A stand-in for the Codex CLI, for replay checks. Not a model: canned replies.
+"""A stand-in for the Codex CLI (exec mode), for replay checks. Canned replies.
 
-Covers exactly what mcp/delegate-server uses:
+Covers what mcp/delegate-server/adapters.py CodexAdapter runs:
 
-* ``codex mcp list --json``  -> ``[]`` (no personal MCP servers to disable)
-* ``codex mcp-server``       -> newline-delimited JSON-RPC on stdio:
-  ``initialize``, ``tools/call`` for ``codex`` and ``codex-reply``, with
-  ``codex/event`` notifications (token_count, agent_message) stamped with
-  ``_meta.requestId`` the way the real CLI does.
+    codex exec --json -s <sandbox> -C <dir> -c ... [-m M] -- <prompt>
+    codex exec resume --json -c ... [-m M] -- <thread_id> <prompt>   (cwd = dir)
+    codex mcp list --json                                           -> []
 
-In a workspace-write sandbox it writes ``DELEGATED-<n>.md`` into ``cwd`` so the
-caller has a diff to summarise. Knobs for concurrency/kill tests:
-FAKE_CODEX_SLEEP (seconds to hold each call), FAKE_CODEX_LOG (append one JSON
-line per call: pid, cwd, sandbox, file written).
+and prints the JSON-lines events the real CLI does (thread.started,
+turn.started, item.completed agent_message, turn.completed usage). It insists
+on the -c overrides the adapter must send (approval_policy, sandbox_mode,
+developer_instructions). In a workspace-write sandbox it writes
+DELEGATED-<n>.md into the directory. Thread ids (thread-<n>) are remembered in
+the repo's common git dir, so resume works across processes and worktrees; an
+unknown id fails like the real CLI ("no rollout found").
+
+Knobs: FAKE_CODEX_SLEEP (seconds per call), FAKE_CODEX_LOG (one JSON line per
+call), FAKE_CODEX_PIDFILE (this process's pid, written at start),
+FAKE_BARRIER_DIR + FAKE_BARRIER_COUNT (wait until that many fakes have entered,
+to prove calls overlap). A prompt containing FAKE:fail fails the turn.
 """
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
-_lock = threading.Lock()
-_threads: dict[str, str] = {}
-_counter = [0]
+T0 = time.time()
 
 
-def send(obj: dict) -> None:
-    with _lock:
-        sys.stdout.write(json.dumps(obj) + "\n")
-        sys.stdout.flush()
+def emit(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
 
 
-def event(rid: int, msg: dict) -> None:
-    send({"jsonrpc": "2.0", "method": "codex/event",
-          "params": {"_meta": {"requestId": rid}, "msg": msg}})
+def barrier() -> bool:
+    d, n = os.environ.get("FAKE_BARRIER_DIR"), int(os.environ.get("FAKE_BARRIER_COUNT") or 0)
+    if not d or n < 2:
+        return True
+    Path(d).mkdir(parents=True, exist_ok=True)
+    (Path(d) / str(os.getpid())).touch()
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if len(list(Path(d).iterdir())) >= n:
+            return True
+        time.sleep(0.1)
+    return False
 
 
-def handle_call(rid: int, name: str, args: dict) -> None:
-    delay = float(os.environ.get("FAKE_CODEX_SLEEP") or 0)
-    if name == "codex":
-        with _lock:
-            _counter[0] += 1
-            n = _counter[0]
-        cwd = Path(args.get("cwd") or ".")
-        sandbox = str(args.get("sandbox") or "")
-        thread_id = f"thread-{n}"
-        _threads[thread_id] = str(cwd)
-        if delay:
-            time.sleep(delay)
-        written = ""
-        if sandbox == "workspace-write":
-            target = cwd / f"DELEGATED-{n}.md"
-            target.write_text(f"# delegated\n\n{args.get('prompt', '')}\n")
-            written = str(target)
-        log = os.environ.get("FAKE_CODEX_LOG")
-        if log:
-            with open(log, "a") as fh:
-                fh.write(json.dumps({"pid": os.getpid(), "cwd": str(cwd), "sandbox": sandbox,
-                                     "written": written, "model": args.get("model", "")}) + "\n")
-        event(rid, {"type": "token_count",
-                    "info": {"total_token_usage": {"input_tokens": 1200, "output_tokens": 34}}})
-        event(rid, {"type": "agent_message", "message": f"fake codex finished ({sandbox})"})
-        send({"jsonrpc": "2.0", "id": rid, "result": {
-            "content": [{"type": "text", "text": f"fake codex: done in {sandbox} sandbox"}],
-            "structuredContent": {"threadId": thread_id}}})
-    elif name == "codex-reply":
-        thread_id = str(args.get("threadId") or "")
-        if thread_id not in _threads:
-            send({"jsonrpc": "2.0", "id": rid, "result": {
-                "content": [{"type": "text", "text": "Session not found for thread_id"}],
-                "isError": True}})
-            return
-        if delay:
-            time.sleep(delay)
-        event(rid, {"type": "token_count",
-                    "info": {"total_token_usage": {"input_tokens": 300, "output_tokens": 12}}})
-        send({"jsonrpc": "2.0", "id": rid, "result": {
-            "content": [{"type": "text", "text": f"fake codex: replied on {thread_id}"}],
-            "structuredContent": {"threadId": thread_id}}})
-    else:
-        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"no tool {name}"}})
+def state_file(cwd: Path) -> Path | None:
+    common = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--git-common-dir"],
+                            capture_output=True, text=True)
+    if common.returncode != 0:
+        return None
+    return (cwd / common.stdout.strip() / "fake-codex-threads.json").resolve()
 
 
-def mcp_server() -> int:
-    for line in sys.stdin:
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
+def parse(args: list[str]) -> tuple[dict[str, str], list[str], list[str]]:
+    """(-s/-C/-m values, -c overrides, positionals after --)."""
+    opts: dict[str, str] = {}
+    configs: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return opts, configs, args[i + 1:]
+        if a in ("-s", "-C", "-m"):
+            opts[a] = args[i + 1]
+            i += 2
             continue
-        method, rid = msg.get("method"), msg.get("id")
-        if method == "initialize":
-            send({"jsonrpc": "2.0", "id": rid, "result": {
-                "protocolVersion": msg["params"].get("protocolVersion", "2025-06-18"),
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-codex", "version": "0"}}})
-        elif method == "tools/call":
-            # one thread per call, so concurrent calls overlap like the real CLI
-            p = msg.get("params") or {}
-            threading.Thread(target=handle_call, args=(rid, p.get("name"), p.get("arguments") or {}),
-                             daemon=True).start()
+        if a == "-c":
+            configs.append(args[i + 1])
+            i += 2
+            continue
+        i += 1
+    return opts, configs, []
+
+
+def run(resume: bool, args: list[str]) -> int:
+    pidfile = os.environ.get("FAKE_CODEX_PIDFILE")
+    if pidfile:
+        Path(pidfile).write_text(str(os.getpid()))
+    opts, configs, pos = parse(args)
+    keys = {c.split("=", 1)[0] for c in configs}
+    for need in ("approval_policy", "sandbox_mode", "developer_instructions"):
+        if need not in keys:
+            print(f"fake codex: missing -c {need}", file=sys.stderr)
+            return 2
+    if 'approval_policy="never"' not in configs:
+        print("fake codex: approval_policy must be never", file=sys.stderr)
+        return 2
+    sandbox = next(c.split("=", 1)[1].strip('"') for c in configs if c.startswith("sandbox_mode="))
+    if resume:
+        if len(pos) != 2:
+            print("fake codex: resume wants -- <id> <prompt>", file=sys.stderr)
+            return 2
+        thread, prompt = pos
+        cwd = Path.cwd()
+    else:
+        if "-s" not in opts or "-C" not in opts or len(pos) != 1 or opts["-s"] != sandbox:
+            print(f"fake codex: bad exec args {args}", file=sys.stderr)
+            return 2
+        thread, prompt, cwd = "", pos[0], Path(opts["-C"])
+    state = state_file(cwd)
+    known: dict[str, str] = json.loads(state.read_text()) if state and state.exists() else {}
+    if resume and thread not in known:
+        print(f"Error: thread/resume: thread/resume failed: no rollout found for thread id "
+              f"{thread} (code -32600)", file=sys.stderr)
+        return 1
+    met = barrier()
+    delay = float(os.environ.get("FAKE_CODEX_SLEEP") or 0)
+    if delay:
+        time.sleep(delay)
+    if not resume:
+        thread = f"thread-{len(known) + 1}"
+        known[thread] = str(cwd)
+        if state:
+            state.write_text(json.dumps(known))
+    emit({"type": "thread.started", "thread_id": thread})
+    emit({"type": "turn.started"})
+    if "FAKE:fail" in prompt:
+        emit({"type": "turn.failed", "error": {"message": "simulated failure inside the turn"}})
+        return 1
+    written = ""
+    if sandbox == "workspace-write" and not resume:
+        target = cwd / f"DELEGATED-{len(known)}.md"
+        target.write_text(f"# delegated\n\n{prompt}\n")
+        written = str(target)
+    log = os.environ.get("FAKE_CODEX_LOG")
+    if log:
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"pid": os.getpid(), "cwd": str(cwd), "sandbox": sandbox,
+                                 "written": written, "model": opts.get("-m", ""),
+                                 "cli": "codex", "barrier_met": met, "t_start": T0, "t_done": time.time()}) + "\n")
+    text = f"fake codex: replied on {thread}" if resume else f"fake codex: done in {sandbox} sandbox"
+    emit({"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": text}})
+    usage = (300, 12) if resume else (1200, 34)
+    emit({"type": "turn.completed", "usage": {"input_tokens": usage[0], "cached_input_tokens": 0,
+                                              "output_tokens": usage[1]}})
     return 0
 
 
@@ -108,11 +148,13 @@ def main(argv: list[str]) -> int:
     if argv[:3] == ["mcp", "list", "--json"]:
         print("[]")
         return 0
-    if argv[:1] == ["mcp-server"]:
-        return mcp_server()
     if argv[:1] == ["--version"]:
         print("codex-cli 0.0.0-fake")
         return 0
+    if argv[:2] == ["exec", "resume"]:
+        return run(True, argv[2:])
+    if argv[:1] == ["exec"]:
+        return run(False, argv[1:])
     print(f"fake codex: unsupported args {argv}", file=sys.stderr)
     return 2
 

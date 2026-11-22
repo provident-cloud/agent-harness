@@ -47,3 +47,11 @@ checks:
       A delegated CLI is stopped (timeout, cancel) but a descendant it started
       keeps running because only the leader was checked.
     timeout: 120
+
+  - id: delegate-worktrees
+    run: python3 -I "$HARNESS_ROOT/evals/checks/delegate_worktrees.py"
+    trap: >
+      A delegated task edits the user's checkout, two tasks on one repo touch
+      each other's files, or a killed run (SIGTERM, client gone, SIGKILL)
+      leaves a worktree behind.
+    timeout: 600

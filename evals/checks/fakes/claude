@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+T0 = time.time()
 
 
 def main(argv: list[str]) -> int:
@@ -56,8 +59,13 @@ def main(argv: list[str]) -> int:
         return 3
     mode, model, resume = opt("--permission-mode"), opt("--model"), opt("--resume")
     cwd = Path.cwd()
-    state = cwd / ".git" / "fake-claude-sessions" if (cwd / ".git").is_dir() else None
-    # sessions are remembered per repo so --resume works across processes
+    # Sessions are remembered in the repo's common git dir, so --resume works
+    # across processes and from any worktree of the repo (like the real CLI,
+    # which finds a session by id from anywhere).
+    common = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--git-common-dir"],
+                            capture_output=True, text=True)
+    state = (cwd / common.stdout.strip() / "fake-claude-sessions").resolve() \
+        if common.returncode == 0 else None
     known: list[str] = []
     if state and state.exists():
         known = state.read_text().split()
@@ -66,6 +74,18 @@ def main(argv: list[str]) -> int:
                           "result": f"No conversation found with session ID: {resume}",
                           "session_id": resume, "total_cost_usd": 0}))
         return 1
+    met = True
+    bdir, bcount = os.environ.get("FAKE_BARRIER_DIR"), int(os.environ.get("FAKE_BARRIER_COUNT") or 0)
+    if bdir and bcount >= 2:  # wait until the other concurrent fake has entered too
+        Path(bdir).mkdir(parents=True, exist_ok=True)
+        (Path(bdir) / str(os.getpid())).touch()
+        deadline = time.time() + 15
+        while len(list(Path(bdir).iterdir())) < bcount and time.time() < deadline:
+            time.sleep(0.1)
+        met = len(list(Path(bdir).iterdir())) >= bcount
+    pidfile = os.environ.get("FAKE_CODEX_PIDFILE")
+    if pidfile:
+        Path(pidfile).write_text(str(os.getpid()))
     delay = float(os.environ.get("FAKE_CLAUDE_SLEEP") or 0)
     if delay:
         time.sleep(delay)
@@ -81,7 +101,8 @@ def main(argv: list[str]) -> int:
     if log:
         with open(log, "a") as fh:
             fh.write(json.dumps({"pid": os.getpid(), "cwd": str(cwd), "sandbox": mode,
-                                 "written": written, "model": model, "cli": "claude"}) + "\n")
+                                 "written": written, "model": model, "cli": "claude",
+                                 "barrier_met": met, "t_start": T0, "t_done": time.time()}) + "\n")
     text = (f"fake claude: replied on {session}" if resume
             else f"fake claude: done in {mode} mode" + (" (model pinned)" if model else ""))
     print(json.dumps({

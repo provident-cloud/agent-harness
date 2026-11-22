@@ -233,7 +233,10 @@ def normalise(value: Any, subs: list[tuple[str, str]]) -> Any:
     if isinstance(value, str):
         for old, new in subs:
             value = value.replace(old, new)
-        # Durations are wall-clock; everything else must be byte-stable.
+        # Durations, task ids and the harness's own commit shas are per-run;
+        # everything else must be byte-stable.
+        value = re.sub(r"delegate/\d{8}-\d{6}-[0-9a-f]{6}", "delegate/<TASK>", value)
+        value = re.sub(r"(commit |based on |HEAD |git diff )[0-9a-f]{12}\b", r"\1<SHA>", value)
         # workspace_search scores include a literal-match boost that depends on
         # whether ripgrep is installed; the ranking and snippets still count.
         value = re.sub(r"\(score -?\d+\.\d+\)", "(score <S>)", value)
@@ -325,6 +328,9 @@ def replay_server(name: str, server: Path, target: Path) -> dict[str, Any]:
                 resolved[k] = v
             resp, notes = session.request("tools/call", {"name": tool, "arguments": resolved})
             entry = call_entry(resp, notes)
+            refs = verify_refs(entry, ws / "demo")
+            if refs is not None:
+                entry["refs_verified"] = refs  # checked before ids are normalised away
             results.append(entry)
             record["calls"].append({"tool": tool, "arguments": args, "result": entry})
         record["journal"] = journal_rows(root / "var" / "usage.jsonl")
@@ -359,6 +365,28 @@ def journal_rows(path: Path) -> list[dict[str, Any]]:
             kept["model_resolved"] = "<mapped by harness_lib>"
         rows.append(kept)
     return rows
+
+
+def verify_refs(entry: dict[str, Any], repo: Path) -> bool | None:
+    """For a result that names a delegate branch: does the branch exist, point at
+    the reported commit, sit on the reported base (the repo's HEAD), and do the
+    review/test/take lines name that same branch and base? None if no branch."""
+    text = "\n".join(t or "" for t in entry.get("text") or [])
+    m = re.search(r"changes are on branch (delegate/\S+) \(commit ([0-9a-f]{12}), "
+                  r"based on ([0-9a-f]{12})\)", text)
+    if not m:
+        return None
+    branch, commit, base = m.groups()
+
+    def rev(ref: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref],
+                              capture_output=True, text=True).stdout.strip()
+
+    tip, head = rev(f"refs/heads/{branch}"), rev("HEAD")
+    parent = rev(f"{branch}^")
+    return (tip.startswith(commit) and head.startswith(base) and parent == head
+            and f"git diff {base}..{branch}" in text and f"--detach {branch}" in text
+            and f"--ff-only {branch}" in text)
 
 
 def _thread_from_text(entry: dict[str, Any]) -> str:

@@ -25,11 +25,12 @@ Rules:
 2. Write the task brief as if for a contractor with no context: goal,
    constraints, file hints, the command that proves the work is done. The
    delegate sees nothing of this conversation.
-3. Default `mode: edit` requires the target repo to have no modified tracked
-   files. If the tool refuses, ask the user whether to commit/stash, or fall
-   back to `mode: review`.
-4. When the call returns, read the diff summary and report it to the user.
-   Review the actual diff before building anything on top of it.
+3. The delegate works in its own worktree at the repo's `HEAD`: uncommitted
+   changes in the checkout are invisible to it. If it needs them, ask the user
+   to commit first.
+4. When the call returns, read the diff summary and report the
+   `delegate/<task-id>` branch it names. Review that diff before building
+   anything on top of it; merging the branch is the user's call.
 5. Use `delegate_reply` with the returned threadId for follow-ups on the same
    task; start fresh for a new task. Thread ids die when the MCP server
    restarts.
