@@ -119,9 +119,17 @@ install stops and changes nothing.
 **The MCP servers run on mcp 2.x** (`mcp>=2.3,<3`). Nothing you call changed:
 same tools, same schemas, same messages, checked by `mcp-replay`. The first
 session after you pull is a few seconds slower while `uv` resolves the new
-SDK. The only protocol-level differences are display-only: the servers no
-longer advertise an empty `experimental` capability, and `serverInfo.version`
-is empty (mcp 1.x filled in its own package version there).
+SDK. On the classic `initialize` handshake (what every client used with the
+old servers) the only differences are display-only: no empty `experimental`
+capability, and an empty `serverInfo.version` (mcp 1.x put its own package
+version there).
+
+One real difference for **clients on the 2026-07-28 protocol**: the spec makes
+log messages a per-request opt-in, so the index-progress lines
+`workspace_search` prints while building the index reach such a client only if
+it sends `io.modelcontextprotocol/logLevel` (e.g. `info`) in the request's
+`_meta`. The result is the same either way; only the progress is silent.
+`mcp-modern` pins this.
 
 ## Choosing a tool
 

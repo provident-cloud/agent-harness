@@ -25,3 +25,11 @@ checks:
       the offload/delegate servers expose: tool names, schemas, error text,
       progress messages. Also fails unless both PEP-723 headers pin mcp 2.x.
     timeout: 600
+
+  - id: mcp-modern
+    run: uv run --quiet --script "$HARNESS_ROOT/evals/checks/mcp_modern.py"
+    trap: >
+      A client on the 2026-07-28 protocol gets different results from the
+      offload server, or progress behaves differently from what USING.md says
+      (spec: log messages only for requests that opt in).
+    timeout: 600
